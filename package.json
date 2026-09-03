@@ -1,0 +1,40 @@
+{
+  "name": "claude-desk",
+  "version": "1.0.0",
+  "description": "可视化 Claude Code 会话窗口(基于真实 claude headless)",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "author": "wanji",
+  "desktopName": "claude-desk.desktop",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "electron .",
+    "app": "npm run build && electron .",
+    "dist": "vite build && electron-builder",
+    "dist:linux": "vite build && electron-builder --linux",
+    "dist:win": "vite build && electron-builder --win",
+    "release": "./scripts/package.sh"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "marked": "^18.0.11",
+    "node-pty": "^1.1.0",
+    "sirv": "^3.0.2"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
+    "@sveltejs/adapter-static": "^3.0.6",
+    "@sveltejs/kit": "^2.9.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^26.15.3",
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
+  }
+}

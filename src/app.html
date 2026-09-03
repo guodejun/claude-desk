@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%sveltekit.assets%/screenshot-20260903-084503.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    %sveltekit.head%
+    <style>
+      /* ---- 主题变量:dark 默认 / light 切换 ---- */
+      :root[data-theme="dark"] {
+        --bg: #0d1117;
+        --surface: #161b22;
+        --surface2: #0d1117;
+        --hover: #1c2129;
+        --border: #21262d;
+        --border-strong: #30363d;
+        --text: #e6edf3;
+        --text2: #c9d1d9;
+        --muted: #8b949e;
+        --muted2: #6e7681;
+        --accent: #58a6ff;
+        --btn-blue: #1f6feb;
+        --btn-green: #238636;
+        --danger: #f85149;
+        --ok: #3fb950;
+        --warn: #d29922;
+        --code-bg: #010409;
+        --overlay: rgba(1, 4, 9, .66);
+        --user-text: #58a6ff;
+        --think: #8b949e;
+        --t-key: #7ee787;
+        --t-str: #ffa657;
+        --t-num: #d2a8ff;
+        --t-lit: #ff7b72;
+        --t-code: #79c0ff;
+        /* 半透明选中态:行高亮(浅)与编辑选区(略深),盖住文本仍可透过看到下层高亮内容 */
+        --sel-bg: rgba(88, 166, 255, .16);
+        --sel-strong: rgba(88, 166, 255, .32);
+        color-scheme: dark;
+      }
+      :root[data-theme="light"] {
+        --bg: #f6f8fa;
+        --surface: #ffffff;
+        --surface2: #f6f8fa;
+        --hover: #d8dee4;
+        --border: #d0d7de;
+        --border-strong: #d8dee4;
+        --text: #1f2328;
+        --text2: #24292f;
+        --muted: #57606a;
+        --muted2: #6e7781;
+        --accent: #0969da;
+        --btn-blue: #0969da;
+        --btn-green: #1a7f37;
+        --danger: #cf222e;
+        --ok: #1a7f37;
+        --warn: #9a6700;
+        --code-bg: #f1f3f4;
+        --overlay: rgba(140, 149, 159, .45);
+        --user-text: #0969da;
+        --think: #57606a;
+        --t-key: #116329;
+        --t-str: #953800;
+        --t-num: #a40e26;
+        --t-lit: #cf222e;
+        --t-code: #0550ae;
+        --sel-bg: rgba(9, 105, 218, .16);
+        --sel-strong: rgba(9, 105, 218, .30);
+        color-scheme: light;
+      }
+      :root {
+        background: var(--bg);
+        --border-strong: #30363d;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      /* ---- 细滚动条 ---- */
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--border-strong);
+        border-radius: 3px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: var(--muted2);
+      }
+      ::-webkit-scrollbar-corner {
+        background: transparent;
+      }
+    </style>
+    <script>
+      // 首屏前应用已保存主题,避免闪烁
+      try {
+        document.documentElement.dataset.theme = localStorage.getItem("cd-theme") || "dark";
+      } catch {}
+    </script>
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

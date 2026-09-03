@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+
+# 构建产物
+# vite 前端构建输出(adapter-static)
+/build
+# SvelteKit 生成目录
+/.svelte-kit
+# electron-builder 中间产物
+/package
+# electron-builder 打包输出(安装包 / 解压根目录)
+/dist
+
+# 环境变量(保留 .env.example 作为示例)
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+npm-debug.log*
+
+# 系统 / 编辑器杂项
+.DS_Store

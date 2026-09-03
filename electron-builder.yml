@@ -1,0 +1,43 @@
+# electron-builder 打包配置
+# 前端产物在 build/(vite adapter-static),打包资源(图标)在 assets/
+appId: com.wanji.claude-desk
+productName: Claude Desk
+
+directories:
+  output: dist
+  buildResources: assets
+
+files:
+  - build/**        # 前端静态产物
+  - electron/**     # 主进程 / 预加载
+  - package.json
+  - assets/icon.png
+  - node_modules/node-pty/**   # 终端会话:node-pty(原生 N-API 模块,含各平台 prebuilt)
+
+# 原生模块必须从 asar 解包(native .node 不能直接在 asar 内加载)
+asarUnpack:
+  - node_modules/node-pty/**
+
+asar: true
+
+# node-pty 自带各平台 prebuilds(win32/darwin/linux),打包时按当前平台产物直接用,
+# 不要触发 @electron/rebuild 从源码交叉编译(node-gyp 不支持跨平台,会直接报错)
+npmRebuild: false
+
+# ---- Linux(Ubuntu)----
+# AppImage:免安装、解压即用,最通用;tar.gz:备用压缩包
+linux:
+  target:
+    - AppImage
+    - tar.gz
+  icon: assets/icon.png
+  category: Development
+  maintainer: wanji
+  syncDesktopName: true
+
+# ---- Windows ----
+win:
+  target:
+    - portable   # 免安装单文件 exe
+    - zip        # 解压即用备用
+  icon: assets/icon.ico
