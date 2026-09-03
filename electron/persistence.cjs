@@ -9,7 +9,7 @@ const crypto = require("crypto");
 
 let base = null; // sessions 目录
 let settingsPath = null;
-let settingsCache = { claudePath: "", terminalFontSize: 13, closeAction: "exit" };
+let settingsCache = { claudePath: "", terminalFontSize: 13, closeAction: "exit", cloud: { serverUrl: "", token: "", deviceName: "桌面电脑", autoStart: false } };
 
 const cache = new Map(); // id -> session 对象(内存权威副本)
 const flushTimers = new Map(); // id -> timer
@@ -310,20 +310,36 @@ function loadSettingsFile() {
       claudePath: raw.claudePath || "",
       terminalFontSize: Number(raw.terminalFontSize) || 13,
       closeAction: raw.closeAction === "tray" ? "tray" : "exit", // 关闭按钮行为:exit 退出 / tray 缩到托盘
+      cloud: {
+        serverUrl: (raw.cloud && raw.cloud.serverUrl) || "",
+        token: (raw.cloud && raw.cloud.token) || "",
+        deviceName: (raw.cloud && raw.cloud.deviceName) || "桌面电脑",
+        autoStart: !!(raw.cloud && raw.cloud.autoStart),
+      },
     };
   } catch {
-    return { claudePath: "", terminalFontSize: 13, closeAction: "exit" };
+    return { claudePath: "", terminalFontSize: 13, closeAction: "exit", cloud: { serverUrl: "", token: "", deviceName: "桌面电脑", autoStart: false } };
   }
 }
 
 function loadSettings() {
-  return { ...settingsCache };
+  return { ...settingsCache, cloud: { ...(settingsCache.cloud || {}) } };
 }
 
 function saveSettings(patch = {}) {
   if (patch.claudePath !== undefined) settingsCache.claudePath = patch.claudePath;
   if (patch.terminalFontSize !== undefined) settingsCache.terminalFontSize = Number(patch.terminalFontSize) || 13;
   if (patch.closeAction !== undefined) settingsCache.closeAction = patch.closeAction === "tray" ? "tray" : "exit";
+  // 云连接配置(与电脑端云桥共享):地址 / token / 设备名 / 是否开机自动连接
+  if (patch.cloud !== undefined && patch.cloud && typeof patch.cloud === "object") {
+    const c = settingsCache.cloud || {};
+    const p = patch.cloud;
+    if (p.serverUrl !== undefined) c.serverUrl = String(p.serverUrl || "");
+    if (p.token !== undefined) c.token = String(p.token || "");
+    if (p.deviceName !== undefined) c.deviceName = String(p.deviceName || "").trim() || "桌面电脑";
+    if (p.autoStart !== undefined) c.autoStart = !!p.autoStart;
+    settingsCache.cloud = c;
+  }
   atomicWrite(settingsPath, JSON.stringify(settingsCache, null, 2));
   return loadSettings();
 }

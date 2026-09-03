@@ -27,11 +27,22 @@ contextBridge.exposeInMainWorld("claude", {
   configTemplateDelete: (id) => ipcRenderer.invoke("config-templates-delete", id),
   configTemplateApply: (id) => ipcRenderer.invoke("config-templates-apply", id),
   pickDirectory: () => ipcRenderer.invoke("pick-directory"),
+  // 云连接(手机远程):查询配置+状态 / 保存并应用;onCloud 订阅状态变化,返回退订函数
+  cloudGet: () => ipcRenderer.invoke("cloud-get"),
+  cloudSet: (patch) => ipcRenderer.invoke("cloud-set", patch),
+  onCloud: (cb) => {
+    const h = (_e, st) => cb(st);
+    ipcRenderer.on("cloud-event", h);
+    return () => ipcRenderer.removeListener("cloud-event", h);
+  },
   claudeVersion: (binPath) => ipcRenderer.invoke("claude-version", binPath),
   claudeUpdate: () => ipcRenderer.invoke("claude-update"),
   claudeResolve: () => ipcRenderer.invoke("claude-resolve"),
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
   logPath: () => ipcRenderer.invoke("log-path"), // 落盘日志路径(userData/claude-desk.log),供设置页展示排查
+  // 剪贴板桥:终端复制/粘贴(主进程 clipboard,渲染层无需授权)
+  clipboardRead: () => ipcRenderer.invoke("clipboard-read"),
+  clipboardWrite: (text) => ipcRenderer.invoke("clipboard-write", String(text ?? "")),
   // 应用版本(供设置页「关于」展示)
   appVersion: () => ipcRenderer.invoke("app-version"),
   // 全屏:切换窗口全屏(F11 快捷键同);onFullscreen 订阅全屏状态变化(按钮图标同步),返回退订函数

@@ -1,0 +1,14 @@
+{
+  "name": "claude-desk-relay",
+  "version": "1.0.0",
+  "description": "Claude Desk 云中转服务:电脑端与手机端的 WebSocket 消息路由 + 手机 H5 页面",
+  "type": "commonjs",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -2,7 +2,7 @@
   // 设置页:界面主题 + claude 可执行文件(动态版本/跨平台发现)
   //  + Claude 配置文件:标准三文件(settings.json / settings.local.json / CLAUDE.md)直接编辑(单编辑区+语法高亮+路径不换行)
   //  + 命名配置模板:存于应用 userData,新增/删除/修改/查询全走该 JSON;下拉选择后一键写入 settings.json
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { ask } from "$lib/stores/dialog.svelte.js";
   import { appSettings, saveSettings, refreshConfigFiles, resolveClaude, deleteConfigFile, templates, refreshTemplates, getTemplate, saveTemplate, deleteTemplate, applyTemplate } from "$lib/stores/settings.svelte.js";
 
@@ -32,15 +32,59 @@
   let logPath = $state(""); // 落盘日志路径(排查问题时展示给用户)
   let appVer = $state(""); // 应用自身版本(底部「关于」展示)
 
+  // ---- 云连接(手机远程):配置 + 实时状态 ----
+  let cloudCfg = $state({ serverUrl: "", token: "", deviceName: "桌面电脑", autoStart: false });
+  let cloudSt = $state({ state: "off", reason: "", deviceId: "" });
+  let cloudMsg = $state("");
+  let unCloud = null;
+
   onMount(() => {
     refreshConfigFiles();
     refreshTemplates();
     autoResolve();
+    loadCloud();
     window.claude.logPath().then((p) => (logPath = p || "")).catch(() => {});
     window.claude.appVersion().then((v) => (appVer = v || "")).catch(() => {});
     try {
       theme = localStorage.getItem("cd-theme") || "dark";
     } catch {}
+  });
+  onDestroy(() => { if (unCloud) unCloud(); });
+
+  // 拉取云端配置 + 当前连接状态,并订阅状态变化实时刷新
+  async function loadCloud() {
+    const r = await window.claude.cloudGet().catch(() => null);
+    if (r) {
+      cloudCfg = { ...cloudCfg, ...(r.config || {}) };
+      cloudSt = r.status || cloudSt;
+    }
+    if (unCloud) unCloud();
+    unCloud = window.claude.onCloud((st) => {
+      cloudSt = st || cloudSt;
+      cloudMsg = "";
+    });
+  }
+
+  // 保存并应用:on=true 立即连接 / on=false 断开
+  async function saveCloud(on) {
+    cloudMsg = on ? "正在连接…" : "正在断开…";
+    const r = await window.claude.cloudSet({ ...cloudCfg, autoStart: !!on }).catch((e) => ({ status: null, error: String(e) }));
+    if (r && r.status) {
+      cloudSt = r.status;
+      cloudMsg = "";
+    } else if (r && r.error) {
+      cloudMsg = `✗ ${r.error}`;
+    }
+  }
+  // 状态文案(设置页徽标颜色随状态切换)
+  const cloudBadge = $derived.by(() => {
+    switch (cloudSt.state) {
+      case "online": return { cls: "on", txt: "● 已上线", t: cloudSt.deviceId };
+      case "connecting": return { cls: "ing", txt: "连接中…", t: cloudSt.reason || "" };
+      case "error": return { cls: "off", txt: "连接失败", t: cloudSt.reason || "" };
+      case "off": return { cls: "off", txt: "已断开（未开启）", t: "" };
+      default: return { cls: "off", txt: cloudSt.state || "未知", t: "" };
+    }
   });
 
   // 动态探测当前 claude 版本/路径(替代原来的硬编码 v2.1.247)
@@ -317,6 +361,32 @@
   </div>
 
   <div class="group">
+    <h2>云连接（手机远程）</h2>
+    <p class="desc">填好云中转服务地址与 token 后点「开启连接」，电脑即以设备身份上线；手机浏览器访问同样的地址（http://服务器IP:端口）可查看并远程操作本机 claude 会话，手机上发的消息会同步显示在电脑终端里。</p>
+    <div class="cloud-grid">
+      <label class="fitem">
+        <span>服务器地址</span>
+        <input data-testid="cloud-url" bind:value={cloudCfg.serverUrl} placeholder="ws://服务器IP:8123 或 ws://域名:端口" autocomplete="off" />
+      </label>
+      <label class="fitem">
+        <span>token（验证密钥）</span>
+        <input type="password" data-testid="cloud-token" bind:value={cloudCfg.token} placeholder="服务器 config.json 里的 token" autocomplete="off" />
+      </label>
+      <label class="fitem">
+        <span>设备名称</span>
+        <input data-testid="cloud-name" bind:value={cloudCfg.deviceName} placeholder="桌面电脑（手机上显示的名字）" autocomplete="off" />
+      </label>
+    </div>
+    <div class="cloud-actions">
+      <button class="primary" data-testid="cloud-on" onclick={() => saveCloud(true)}>开启连接</button>
+      <button class="ghost" data-testid="cloud-off" onclick={() => saveCloud(false)}>断开</button>
+      <span class="cloud-badge {cloudBadge.cls}" data-testid="cloud-status" title={cloudSt.reason || ""}><span class="dot"></span>{cloudBadge.txt}{#if cloudBadge.t}<code class="cid" title="设备ID（手机端不可见，仅供排查）">{cloudBadge.t}</code>{/if}</span>
+    </div>
+    {#if cloudMsg}<div class="msgline">{cloudMsg}</div>{/if}
+    <p class="tip">连接后手机访问 <code>http://{cloudCfg.serverUrl ? cloudCfg.serverUrl.replace(/^wss?:\/\//, "").replace(/\/ws$/, "") : "服务器IP:端口"}</code> ，填入同一 token 即可。手机指令直接落到电脑端真实终端，回复自动传回。</p>
+  </div>
+
+  <div class="group">
     <h2>命名配置模板</h2>
     <p class="desc">把常用配置存成「名字 + 内容」的模板（数据保存在应用自己的 userData json 里），通过下拉选择后一键写入 <code>~/.claude/settings.json</code> 并立即生效。</p>
     <div class="tmpl-bar">
@@ -463,6 +533,20 @@
   .fitem input { width: 120px; background: var(--bg); border: 1px solid var(--border-strong); color: var(--text); border-radius: 8px; padding: 9px 12px; font: inherit; }
   .fitem input:focus { outline: none; border-color: var(--accent); }
   .fitem small { font-size: 11px; }
+
+  /* 云连接 */
+  .cloud-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  .cloud-grid .fitem input { width: 100%; }
+  .cloud-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cloud-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; margin-left: 4px; }
+  .cloud-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted2); display: inline-block; }
+  .cloud-badge.on .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .cloud-badge.ing .dot { background: #d29922; }
+  .cloud-badge.off .dot { background: var(--danger); }
+  .cloud-badge.on { color: var(--ok); }
+  .cloud-badge.ing { color: #d29922; }
+  .cloud-badge.off { color: var(--danger); }
+  .cloud-badge .cid { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); font-weight: 400; background: var(--bg); padding: 1px 6px; border-radius: 4px; }
   .primary { background: var(--btn-green); border: none; color: #fff; border-radius: 8px; padding: 9px 16px; cursor: pointer; font-weight: 600; }
   .primary.small { font-size: 12px; padding: 6px 12px; }
   .ghost { background: var(--border); border: 1px solid var(--border-strong); color: var(--text); border-radius: 8px; padding: 8px 14px; cursor: pointer; }

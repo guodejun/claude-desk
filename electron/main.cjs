@@ -4,7 +4,7 @@
 // 关键设计:底层就是真实 claude,hooks / slash commands / MCP / 配置全部原样生效,
 //          这一层只负责"开进程 + 落库 + 转发 + 状态"。
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, nativeImage, nativeTheme, screen } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, nativeImage, nativeTheme, screen, clipboard } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -16,6 +16,7 @@ const pty = require("./pty.cjs");
 const tunnel = require("./tunnel.cjs");
 const contextmon = require("./contextmon.cjs");
 const configs = require("./configs.cjs");
+const bridge = require("./bridge.cjs"); // 云连接桥:电脑端外连中转服务,手机可远程操作
 const log = require("./log.cjs");
 
 // 去掉顶层原生菜单(File/Edit/View/Window/Help),保持纯 UI
@@ -300,6 +301,8 @@ function createWindow() {
   if (process.env.CD_AUTOTEST === "1") runAutotest();
   // 终端自测(终端形态 A):建会话→进对话页→验证 xterm 渲染真实 claude→关闭→删除
   if (process.env.CD_TERM_AUTOTEST === "1") runTermAutotest();
+  // 云连接自测:起本地中转 → 设置页开云 → 手机角色全流程(见 runCloudAutotest)
+  if (process.env.CD_CLOUD_AUTOTEST === "1") runCloudAutotest();
   // 上下文压测:持续喂消息观察统计增长/自动压缩(见 ctxdrive.cjs)
   if (process.env.CD_CTX_AUTOTEST === "1") require("./ctxdrive.cjs")(win);
 }
@@ -586,6 +589,27 @@ ipcMain.handle("settings-set", (_e, patch) => {
 // 应用自身版本(读取 package.json / 打包产物 version),供设置页「关于」展示
 ipcMain.handle("app-version", () => app.getVersion());
 
+// ---- 云连接(手机远程) ----
+// 查询:云端配置 + 连接状态(设置页初始化/刷新)
+ipcMain.handle("cloud-get", () => {
+  const cloud = persistence.loadSettings().cloud || {};
+  return { config: { serverUrl: cloud.serverUrl, token: cloud.token, deviceName: cloud.deviceName, autoStart: cloud.autoStart }, status: bridge.status() };
+});
+// 保存云端配置并应用:patch={serverUrl?,token?,deviceName?,autoStart?}
+// autoStart=true → 立即连接;false → 断开。状态变化经 cloud-event 回推渲染层
+ipcMain.handle("cloud-set", (_e, patch) => {
+  const cloud = persistence.loadSettings().cloud || {};
+  const next = {
+    serverUrl: patch.serverUrl !== undefined ? patch.serverUrl : cloud.serverUrl,
+    token: patch.token !== undefined ? patch.token : cloud.token,
+    deviceName: patch.deviceName !== undefined ? patch.deviceName : cloud.deviceName,
+    autoStart: patch.autoStart !== undefined ? patch.autoStart : cloud.autoStart,
+  };
+  persistence.saveSettings({ cloud: next });
+  bridge.applyConfig(next);
+  return { config: next, status: bridge.status() };
+});
+
 ipcMain.handle("configs-list", () => {
   return configs.listConfigFiles();
 });
@@ -676,6 +700,15 @@ ipcMain.handle("cancel-close", () => {
   resetClosePrompt();
 });
 
+// 剪贴板桥:终端复制/粘贴走主进程(渲染层 navigator.clipboard 需授权,主进程 clipboard 最稳且不限上下文)
+ipcMain.handle("clipboard-read", () => {
+  try { return clipboard.readText(); } catch { return ""; }
+});
+ipcMain.handle("clipboard-write", (_e, text) => {
+  try { clipboard.writeText(String(text ?? "")); } catch {}
+  return true;
+});
+
 ipcMain.handle("log-path", () => log.logPath);
 ipcMain.handle("claude-resolve", async () => {
   // 返回实际使用的 claude 二进制路径 + 版本(供设置页动态显示)
@@ -728,13 +761,25 @@ ipcMain.handle("claude-update", async () => {
 });
 
 app.whenReady().then(() => {
+  // 自测隔离:CD_USERDATA 指定独立数据目录,避免自动测试污染真实会话/设置(默认走系统 userData)
+  if (process.env.CD_USERDATA) app.setPath("userData", process.env.CD_USERDATA);
   // 落盘日志:打包后 stdout 不可见,问题排查全靠 userData/claude-desk.log
   log.init(app.getPath("userData"));
   log.teeConsole(); // 主进程 console.* 一并写入,渲染进程转发的 warn/error 也会落到这里
   log.log("info", "主进程就绪,窗口创建中");
   persistence.init(app);
   configs.init(app.getPath("userData"));
+  bridge.init({ userData: app.getPath("userData") });
+  // 云连接状态 → 渲染层(设置页实时展示;不依赖哪个窗口在,这里统一转发)
+  bridge.onStatus((st) => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send("cloud-event", st);
+    }
+  });
   createWindow();
+  // 若设置了「开机自动连接云」,窗口就绪后直接连
+  const cloud = persistence.loadSettings().cloud || {};
+  if (cloud.autoStart) bridge.applyConfig({ serverUrl: cloud.serverUrl, token: cloud.token, deviceName: cloud.deviceName, autoStart: true });
   // 若设置是「关闭=缩到托盘」,启动即常驻托盘(设置项存于用户环境,随时可改)
   if ((persistence.loadSettings().closeAction || "exit") === "tray") ensureTray();
 });
@@ -757,6 +802,175 @@ function listAllRunning() {
     .listSessions()
     .filter((s) => s.running)
     .map((s) => s.id);
+}
+
+// ---- 云连接自测(CD_CLOUD_AUTOTEST=1) ----
+// 真实 Electron 壳内联调:本地起中转服务 → 通过 IPC+设置页开启云连接 → 主进程以「手机」角色
+// 走完整流程(握手/设备列表/会话列表/打开会话/停止/断开)。不碰真实 claude 终端与真实数据
+// (配合 CD_USERDATA 指定独立 userData 更干净)。
+async function runCloudAutotest() {
+  const exec = (js) => win.webContents.executeJavaScript(js);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const fails = [];
+  const ok = (label, cond, extra = "") => {
+    console.log(`${cond ? "AUTOTEST_PASS" : "AUTOTEST_FAIL"} ${label}${extra ? " :: " + extra : ""}`);
+    if (!cond) fails.push(label);
+  };
+  const { spawn } = require("child_process");
+  const crypto = require("crypto");
+  const { WebSocket } = require("ws");
+  const https = require("http");
+
+  const PORT = 8900 + Math.floor(Math.random() * 300);
+  const TOKEN = "cd-auto-" + crypto.randomBytes(6).toString("hex");
+  const srv = spawn(process.platform === "win32" ? "node.exe" : "node", [path.join(__dirname, "..", "server", "server.cjs"), "--port", String(PORT), "--token", TOKEN], { stdio: ["ignore", "pipe", "pipe"] });
+  srv.stdout.on("data", (d) => console.log("[relay] " + String(d).trim()));
+  srv.stderr.on("data", (d) => console.log("[relay-err] " + String(d).trim()));
+  srv.on("exit", (code) => console.log("[relay] EXIT code=" + code));
+
+  // 简易 http 请求(等 /health)
+  const httpGet = (p) => new Promise((res) => {
+    const r = https.get({ host: "127.0.0.1", port: PORT, path: p, timeout: 2000 }, (resp) => { resp.resume(); resp.on("end", () => res(resp.statusCode)); });
+    r.on("error", () => res(0));
+    r.on("timeout", () => { r.destroy(); res(0); });
+  });
+
+  try {
+    // 等中转服务就绪
+    let up = false;
+    for (let i = 0; i < 60; i++) {
+      if ((await httpGet("/health")) === 200) { up = true; break; }
+      await wait(200);
+    }
+    ok("本地中转服务起来", up);
+
+    // 1. 设置页云 UI 存在
+    await win.loadURL(global.__baseUrl + "settings");
+    await wait(900);
+    const ui = await exec(`({
+      url: !!document.querySelector('[data-testid=cloud-url]'),
+      token: !!document.querySelector('[data-testid=cloud-token]'),
+      name: !!document.querySelector('[data-testid=cloud-name]'),
+      on: !!document.querySelector('[data-testid=cloud-on]'),
+      status: !!document.querySelector('[data-testid=cloud-status]'),
+    })`);
+    ok("设置页云连接 UI 齐全", ui.url && ui.token && ui.name && ui.on && ui.status, JSON.stringify(ui));
+
+    // 2. IPC 开启云连接(autoStart=true)→ 状态应达 online
+    const setVal = `(sel, v) => { const el = document.querySelector(sel); Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set.call(el, v); el.dispatchEvent(new Event("input", { bubbles: true })); }`;
+    await exec(`(${setVal})('[data-testid=cloud-url]', ${JSON.stringify("ws://127.0.0.1:" + PORT)}); (${setVal})('[data-testid=cloud-token]', ${JSON.stringify(TOKEN)}); (${setVal})('[data-testid=cloud-name]', '自测电脑');`);
+    await wait(300);
+    await exec(`document.querySelector('[data-testid=cloud-on]').click()`);
+    let stOnline = false;
+    let stJson = "";
+    for (let i = 0; i < 60; i++) {
+      const r = await exec(`window.claude.cloudGet().then(x => JSON.stringify(x.status))`).catch(() => '"{}"');
+      stJson = r;
+      if (JSON.parse(r).state === "online") { stOnline = true; break; }
+      await wait(300);
+    }
+    ok("开启云连接后状态 online", stOnline, `st=${stJson}`);
+    const devId = JSON.parse(stJson).deviceId;
+
+    // 3. 状态徽标渲染为已上线
+    let badge = "";
+    for (let i = 0; i < 30; i++) {
+      badge = await exec(`(document.querySelector('[data-testid=cloud-status]') || { textContent: '' }).textContent`).catch(() => "");
+      if (badge.includes("已上线")) break;
+      await wait(200);
+    }
+    ok("设置页状态徽标「已上线」", badge.includes("已上线"), `badge=${badge.trim()}`);
+
+    // 4. 建一个会话,手机端应能列出
+    const created = JSON.parse(await exec(`window.claude.sessionCreate({ cwd:${JSON.stringify(os.tmpdir())}, title:"云自测会话" }).then(x=>JSON.stringify(x))`));
+    ok("自测会话创建", !!created.id);
+    // 预置一段实录,让 H5「打开会话」能看到回传的上下文(模拟会话跑过对话)
+    persistence.setTranscript(created.id, "用户：你好\n助手：你好！这是一段用于云自测的历史对话记录。\n");
+
+    // 5. 主进程扮演手机:握手 → 设备列表 → 会话列表 → 打开会话
+    const phoneDone = await new Promise((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+      const out = { devices: null, sessions: null, info: null, stop: null };
+      const timer = setTimeout(() => resolve(out), 25000);
+      ws.on("open", () => ws.send(JSON.stringify({ type: "hello", role: "phone", token: TOKEN })));
+      ws.on("message", (b) => {
+        const m = JSON.parse(b.toString());
+        if (m.type === "welcome" && m.ok) {
+          out.devices = (m.devices || []).find((d) => d.deviceId === devId) ? "FOUND" : JSON.stringify(m.devices);
+          ws.send(JSON.stringify({ type: "list-sessions", msgId: "r1", deviceId: devId }));
+        } else if (m.type === "sessions" && m.msgId === "r1") {
+          out.sessions = (m.sessions || []).find((s) => s.id === created.id) ? "FOUND" : JSON.stringify(m.sessions);
+          ws.send(JSON.stringify({ type: "open-session", msgId: "r2", deviceId: devId, sessionId: created.id }));
+        } else if (m.type === "session-info" && m.msgId === "r2") {
+          out.info = m.sessionId === created.id ? "FOUND" : JSON.stringify(m);
+          ws.send(JSON.stringify({ type: "stop", msgId: "r3", deviceId: devId, sessionId: created.id }));
+        } else if (m.type === "answer" && m.msgId === "r3") {
+          out.stop = m.ok ? "FOUND" : JSON.stringify(m);
+          clearTimeout(timer);
+          try { ws.close(); } catch {}
+          resolve(out);
+        }
+      });
+      ws.on("error", () => { clearTimeout(timer); resolve(out); });
+    });
+    ok("手机可见本设备", phoneDone.devices === "FOUND", `devices=${phoneDone.devices}`);
+    ok("手机可见自测会话", phoneDone.sessions === "FOUND", `sessions=${phoneDone.sessions}`);
+    ok("手机打开会话信息回传", phoneDone.info === "FOUND", `info=${phoneDone.info}`);
+    ok("手机 stop 受理", phoneDone.stop === "FOUND", `stop=${phoneDone.stop}`);
+
+    // 7. 真实 H5 手机页全流程:页面 JS → 中转 → 桥(连接/设备/会话/打开对话拿上下文)
+    await win.loadURL(`http://127.0.0.1:${PORT}/`);
+    await wait(800);
+    ok("H5 页连接界面加载", !!(await exec(`!!document.querySelector('#btn-connect')`)));
+    // 填 token 点连接(服务器地址默认已取当前页 origin)
+    await exec(`(() => {
+      const i = document.querySelector('#in-token');
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(i, ${JSON.stringify(TOKEN)});
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#btn-connect').click();
+      return true;
+    })()`);
+    let devItem = "";
+    for (let i = 0; i < 40; i++) {
+      devItem = await exec(`(() => { const el = document.querySelector('#devlist .item'); return el ? el.textContent.replace(/\\s+/g, ' ').trim() : ''; })()`).catch(() => "");
+      if (devItem.includes("自测电脑")) break;
+      await wait(250);
+    }
+    ok("H5 进入设备视图并看到本机", devItem.includes("自测电脑"), `item=${devItem}`);
+    await exec(`document.querySelector('#devlist .item').click()`).catch(() => {});
+    let sesItem = "";
+    for (let i = 0; i < 40; i++) {
+      sesItem = await exec(`(() => { const el = document.querySelector('#seslist .item'); return el ? el.textContent.replace(/\\s+/g, ' ').trim() : ''; })()`).catch(() => "");
+      if (sesItem.includes("云自测会话")) break;
+      await wait(250);
+    }
+    ok("H5 会话列表看到自测会话", sesItem.includes("云自测会话"), `item=${sesItem}`);
+    await exec(`document.querySelector('#seslist .item').click()`).catch(() => {});
+    let ctxText = "";
+    for (let i = 0; i < 40; i++) {
+      ctxText = await exec(`(() => { const el = document.getElementById('chat-ctx'); return el && el.style.display !== 'none' ? el.textContent.slice(0, 40) : ''; })()`).catch(() => "");
+      if (ctxText.length) break;
+      await wait(250);
+    }
+    ok("H5 打开会话回传上下文", ctxText.length > 0, `ctx=${ctxText.replace(/\n/g, " ").slice(0, 60)}`);
+
+    // 8. 断开云连接 → 设备下线(此刻窗口停在 H5 页,直接主进程侧关云,不依赖页面元素)
+    bridge.applyConfig({ autoStart: false });
+    await wait(500);
+    const stOff = bridge.status();
+    ok("断开后状态非 online", stOff.state !== "online", `st=${JSON.stringify(stOff).slice(0, 120)}`);
+
+    // 7. 清理:删自测会话、恢复配置
+    await exec(`window.claude.sessionDelete(${JSON.stringify(created.id)})`);
+    await exec(`window.claude.cloudSet({ serverUrl:"", token:"", autoStart:false })`);
+
+    console.log(fails.length === 0 ? "AUTOTEST_OK CLOUD ALL PASS" : `AUTOTEST_FAIL n=${fails.length}: ${JSON.stringify(fails)}`);
+  } catch (err) {
+    console.log("AUTOTEST_FAIL EXCEPTION " + String((err && err.stack) || err));
+  } finally {
+    try { srv.kill(); } catch {}
+    setTimeout(() => app.quit(), 200);
+  }
 }
 
 // ---- 终端自测(CD_TERM_AUTOTEST=1) ----

@@ -259,6 +259,75 @@
   const rAF = (fn) => requestAnimationFrame(fn);
   const rAFSb = () => rAF(updateScroller);
 
+  // ---- 复制 / 粘贴(经主进程剪贴板) ----
+  // 背景:claude TUI 是全文 alternate screen 重绘,xterm 默认粘贴走浏览器行为不靠谱、
+  // Ctrl+C 又必须留给 claude 当中断信号,回答文字因整屏重绘也很难鼠标选中。
+  // 所以:粘贴 = 读系统剪贴板经 pty 写入(Ctrl+V / Ctrl+Shift+V / Shift+Insert/右键);
+  // 复制 = Ctrl+Shift+C 复制选区,选不中(整屏重绘导致)时右键菜单「复制整屏」兜底取最近一屏。
+  async function getClipText() {
+    try {
+      return (await window.claude.clipboardRead()) || "";
+    } catch {
+      return "";
+    }
+  }
+  function setClip(t) {
+    try {
+      window.claude.clipboardWrite(String(t ?? ""));
+    } catch {}
+  }
+  // 粘贴:终端是 raw 模式,多行文本的换行必须归一成 \r(回车),\n 只会下移光标不会提交
+  async function pasteTerm() {
+    if (reviewing) exitReview();
+    const t = await getClipText();
+    if (!t) return;
+    window.claude.terminalWrite(id, String(t).replace(/\r\n/g, "\n").replace(/\n/g, "\r"));
+  }
+  function copyTerm() {
+    // 有选区复制选区;TUI 重绘会让选区很快失效,没选到就用「复制整屏」兜底,保证一定有产出
+    let sel = "";
+    try {
+      sel = term.getSelection() || "";
+    } catch {}
+    if (sel) setClip(sel);
+    else copyScreen();
+  }
+  // 复制最近一屏(claude 回答的可靠兜底:直接取自积累的行历史末端)
+  function copyScreen() {
+    const rows = term?.rows || 30;
+    const out = histLines.slice(-rows).join("\n");
+    if (out) setClip(out + "\n");
+  }
+
+  // 右键菜单状态(自绘,与应用其它弹窗统一风格):菜单按鼠标位置定位
+  let ctxMenu = $state(null); // { x, y }
+  function closeMenu() {
+    ctxMenu = null;
+  }
+  function onHostCtx(e) {
+    e.preventDefault();
+    if (!term) return;
+    const mw = 150;
+    const mh = 118;
+    let x = Math.min(e.clientX, window.innerWidth - mw - 8);
+    let y = Math.min(e.clientY, window.innerHeight - mh - 8);
+    if (x < 8) x = 8;
+    if (y < 8) y = 8;
+    ctxMenu = { x, y };
+  }
+  function doCopyMenu() {
+    copyTerm();
+    closeMenu();
+  }
+  function doCopyScreenMenu() {
+    copyScreen();
+    closeMenu();
+  }
+  async function doPasteMenu() {
+    closeMenu();
+    await pasteTerm();
+  }
+
   onMount(() => {
     if (!host) return;
     term = new Terminal({
@@ -307,6 +376,26 @@
       window.claude.terminalWrite(id, d);
     });
     term.onResize(() => pushSize());
+
+    // 复制/粘贴快捷键:Ctrl+C 保持原样发给 claude(中断信号),不能占用;
+    // 复制走 Ctrl/Cmd+Shift+C(有选区复制选区,无选区兜底整屏),粘贴走 Ctrl/Cmd+V / Shift+Insert。
+    term.attachCustomKeyEventHandler((e) => {
+      if (!e || e.type !== "keydown") return true;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.shiftKey && (e.key === "C" || e.key === "c")) {
+        copyTerm();
+        return false;
+      }
+      if (mod && (e.key === "V" || e.key === "v")) {
+        pasteTerm();
+        return false;
+      }
+      if (e.shiftKey && e.key === "Insert") {
+        pasteTerm();
+        return false;
+      }
+      return true; // 其余按键(含 Ctrl+C)原样交给 claude TUI
+    });
 
     // 全局终端事件按会话过滤;组件卸载时退订
     unsubscribe = window.claude.onTerminal((ev) => {
@@ -382,7 +471,17 @@
   {#if err}
     <div class="errbar" data-testid="term-err">⚠ {err}</div>
   {:else}
-    <div class="host" bind:this={host}>
+    <div class="host" bind:this={host} oncontextmenu={onHostCtx}>
+      {#if ctxMenu}
+        <!-- 右键菜单(复制/粘贴,覆盖 TUI 整屏重绘选不中文案的痛点) -->
+        <div class="cm-mask" onclick={closeMenu} oncontextmenu={(e) => { e.preventDefault(); closeMenu(); }}></div>
+        <div class="cm" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px" role="menu">
+          <button onclick={doCopyMenu} title="复制选中文字,未选中则复制最近一屏">📋 复制</button>
+          <button onclick={doCopyScreenMenu} title="复制终端最近一屏(claude 回答常用)>">🖼 复制整屏</button>
+          <div class="cm-sep"></div>
+          <button onclick={doPasteMenu} title="把剪贴板内容粘贴到终端输入行">📥 粘贴</button>
+        </div>
+      {/if}
       {#if reviewing}
         <!-- 回看层:覆盖终端显示历史文本(TUI 全屏 no scrollback,历史由我们自存) -->
         <div class="review" data-testid="terminal-review" style="--rowH:{rowH || 15}px;--rows:{term ? term.rows : 24}">
@@ -416,6 +515,12 @@
   .host :global(.xterm) { height: 100%; }
   /* 禁用 xterm 自绘滚动条(monaco slider 在 alt 屏恒 0 高失效,且与我们自绘条重复),统一用 .sb */
   .host :global(.xterm-scrollable-element > .scrollbar) { display: none !important; }
+  /* 右键菜单:fixed 覆盖层 + 自绘小菜单,与应用其它弹窗统一的暗色圆角风格;点击任意处/再右键关闭 */
+  .host .cm-mask { position: fixed; inset: 0; z-index: 9; }
+  .host .cm { position: fixed; z-index: 10; min-width: 148px; background: #1c2128; border: 1px solid #30363d; border-radius: 8px; padding: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, .45); }
+  .host .cm button { display: flex; width: 100%; align-items: center; gap: 8px; background: transparent; border: 0; color: var(--text, #e6edf3); font-size: 12.5px; padding: 7px 10px; border-radius: 6px; cursor: pointer; text-align: left; }
+  .host .cm button:hover { background: rgba(88, 166, 255, .14); color: var(--accent, #58a6ff); }
+  .host .cm .cm-sep { height: 1px; background: #21262d; margin: 4px 6px; }
   /* 回看覆盖层:等宽字体按终端行距逐行渲染历史,顶层盖住实时画面,文本区不拦截指针(滚轮/点击穿透到终端) */
   .host .review { position: absolute; inset: 6px 8px 0; z-index: 4; background: #0d1117; overflow: hidden; font-family: ui-monospace, Menlo, Consolas, "Cascadia Mono", monospace; font-size: 13px; line-height: 1; }
   .host .review .rev-inner { position: absolute; top: 0; left: 0; right: 6px; color: #e6edf3; }

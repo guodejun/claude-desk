@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Claude Desk · 手机遥控</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d; --border2: #484f58;
+    --text: #e6edf3; --text2: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --ok: #3fb950; --err: #f85149; --user-bg: #1f6feb; --ans-bg: #21262d;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    font-size: 15px; display: flex; flex-direction: column; height: 100dvh;
+  }
+  header.top {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding: 12px 14px; padding-top: calc(12px + env(safe-area-inset-top));
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  header.top b { font-size: 15px; }
+  header.top .sub { font-size: 12px; color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  header.top .back { background: none; border: none; color: var(--accent); font-size: 14px; cursor: pointer; padding: 4px 6px; }
+  main { flex: 1 1 auto; overflow-y: auto; padding: 14px 14px 20px; }
+  .view { display: none; }
+  .view.on { display: block; }
+
+  /* 连接 */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 18px; margin-bottom: 14px; }
+  .card h2 { margin: 0 0 4px; font-size: 16px; }
+  .card .d { color: var(--muted); font-size: 13px; margin: 0 0 14px; line-height: 1.6; }
+  label.f { display: block; margin-bottom: 12px; }
+  label.f span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  input, select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border2); color: var(--text);
+    border-radius: 10px; padding: 11px 12px; font-size: 15px; font-family: inherit;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  button.go {
+    width: 100%; background: var(--accent); color: #04233d; border: none; border-radius: 10px;
+    padding: 12px; font-size: 15px; font-weight: 700; cursor: pointer;
+  }
+  button.go:disabled { opacity: .5; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+  .dot.online { background: var(--ok); } .dot.offline { background: var(--err); }
+  .url-tip { text-align: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
+
+  /* 列表 */
+  .item {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 10px; color: var(--text); cursor: pointer;
+  }
+  .item .tt { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .sub { font-size: 12px; color: var(--muted); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .stat { margin-left: auto; flex: 0 0 auto; font-size: 11px; color: var(--muted); text-align: right; }
+  .empty { color: var(--muted); text-align: center; padding: 30px 0; font-size: 13px; }
+
+  /* 对话 */
+  .chat { display: flex; flex-direction: column; height: 100%; padding: 0; }
+  .msgs { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px; }
+  .bubble { max-width: 88%; border-radius: 14px; padding: 10px 13px; margin-bottom: 10px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .bubble.user { background: var(--user-bg); color: #fff; margin-left: auto; }
+  .bubble.ans  { background: var(--ans-bg); color: var(--text); }
+  .bubble.err  { background: rgba(248, 81, 73, .15); color: var(--err); }
+  .bubble.running { opacity: .7; }
+  @keyframes blink { 50% { opacity: .3; } }
+  .running-dot { display: inline-block; animation: blink 1.2s infinite; }
+  .ctx-box { background: var(--surface); border: 1px dashed var(--border2); border-radius: 10px; padding: 10px 12px; margin: 0 14px 10px; font-size: 12px; color: var(--muted); max-height: 30vh; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  .composer { flex: 0 0 auto; display: flex; gap: 8px; padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); background: var(--surface); border-top: 1px solid var(--border); }
+  .composer input { flex: 1 1 auto; }
+  .composer button { flex: 0 0 auto; }
+  button.round { background: var(--accent); color: #04233d; border: none; border-radius: 10px; padding: 0 16px; font-size: 14px; font-weight: 700; cursor: pointer; }
+  button.round.stop { background: var(--err); color: #fff; }
+
+  /* 断开横幅 */
+  .banner { position: sticky; top: 0; z-index: 5; background: rgba(248, 81, 73, .9); color: #fff; text-align: center; font-size: 12px; padding: 5px; }
+  .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: 100px; background: #30363d; color: #fff; border-radius: 8px; padding: 8px 14px; font-size: 13px; display: none; z-index: 20; }
+</style>
+</head>
+<body>
+  <!-- 连接 -->
+  <section id="v-connect" class="view on">
+    <main>
+      <div class="card">
+        <h2>📱 Claude Desk 手机遥控</h2>
+        <p class="d">通过云中转服务连接自己的电脑：输入与电脑端「云连接」一致的 <b>地址</b> 和 <b>token</b>，
+        即可查看电脑上所有 claude 会话并远程对话。发送的消息会同步出现在电脑端终端里，回复也会自动传回。</p>
+        <label class="f"><span>服务器地址</span>
+          <input id="in-host" placeholder="ws://1.2.3.4:8123 或 ws://主机名:端口" autocomplete="off" />
+        </label>
+        <label class="f"><span>token（验证密钥）</span>
+          <input id="in-token" type="password" placeholder="在服务器 config.json 或启动日志里查看" autocomplete="off" />
+        </label>
+        <button id="btn-connect" class="go">连接</button>
+        <div class="url-tip" id="url-tip"></div>
+      </div>
+    </main>
+  </section>
+
+  <!-- 设备 -->
+  <section id="v-devices" class="view">
+    <header class="top">
+      <b>选择电脑</b><span class="sub">（在线设备）</span>
+      <span style="margin-left:auto"><button class="back" id="btn-device-back">断开</button></span>
+    </header>
+    <main id="devlist"></main>
+  </section>
+
+  <!-- 会话 -->
+  <section id="v-sessions" class="view">
+    <header class="top">
+      <button class="back" id="btn-session-back">‹</button>
+      <span style="flex:1;min-width:0"><b id="dev-name"></b><div class="sub" id="session-sub"></div></span>
+      <button class="back" id="btn-refresh-sessions">↻</button>
+    </header>
+    <main id="seslist"></main>
+  </section>
+
+  <!-- 对话 -->
+  <section id="v-chat" class="view">
+    <div class="banner" id="chat-banner" style="display:none"></div>
+    <header class="top">
+      <button class="back" id="btn-chat-back">‹</button>
+      <span style="flex:1;min-width:0"><b id="chat-title"></b><div class="sub" id="chat-cwd"></div></span>
+      <button class="back" id="btn-stop" style="display:none">■ 停止</button>
+    </header>
+    <div class="chat">
+      <div class="ctx-box" id="chat-ctx" style="display:none"></div>
+      <div class="msgs" id="msgs"></div>
+      <div class="composer">
+        <input id="in-msg" placeholder="输入消息，回车发送…" autocomplete="off" />
+        <button class="round" id="btn-send">发送</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+  // ---------- 状态 ----------
+  let ws = null;                 // WebSocket 连接
+  let token = localStorage.getItem("cd-token") || "";
+  let curDevice = null;          // 选中的设备 {deviceId,deviceName}
+  let curSession = null;         // 选中的会话 {id,title,cwd}
+  let devices = [];              // 在线设备列表(服务端推送/应答)
+  let sessions = [];             // 当前设备会话列表
+  let msgs = [];                 // 当前会话的消息气泡 [{dir:'user'|'ans', text, running}]
+  let pendingExec = null;        // 进行中的 exec msgId
+  let lastAnsIndex = -1;         // 等待回答的气泡下标
+  let reconnectTimer = null, retry = 0;
+  let manualClose = false;
+
+  const $ = (id) => document.getElementById(id);
+  const hostInput = $("in-host"), tokenInput = $("in-token");
+  let autoHost = location.protocol === "https:" ? "wss://" : "ws://";
+  autoHost += location.host + "/ws";
+
+  // 启动时回填上次保存的配置
+  hostInput.value = localStorage.getItem("cd-host") || autoHost;
+  tokenInput.value = token;
+  $("url-tip").textContent = "当前页面地址：" + location.host + "（如已部署，默认用这个地址即可）";
+
+  function go(view) {
+    document.querySelectorAll(".view").forEach((v) => v.classList.remove("on"));
+    $("v-" + view).classList.add("on");
+  }
+  function toast(t) {
+    const el = $("toast");
+    el.textContent = t; el.style.display = "block";
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => (el.style.display = "none"), 2600);
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function hh(ts) { // 时间显示
+    if (!ts) return "";
+    const d = new Date(ts);
+    return (d.getMonth() + 1) + "-" + d.getDate() + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+
+  // ---------- 消息发送/应答 ----------
+  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+  let mid = 0;
+  const nextId = () => "m" + (++mid) + "-" + Date.now();
+
+  // ---------- 渲染 ----------
+  function renderDevices() {
+    const el = $("devlist");
+    if (!devices.length) { el.innerHTML = '<div class="empty">没有在线电脑<br/>请先在电脑端设置页开启「云连接」</div>'; return; }
+    el.innerHTML = devices.map((d) => `
+      <button class="item" data-id="${esc(d.deviceId)}">
+        <span class="dot online"></span>
+        <span style="flex:1;min-width:0"><span class="tt">🖥 ${esc(d.deviceName)}</span>
+        <div class="sub">${esc(d.ip || "")} · 上线 ${hh(d.since)}</div></span>
+        <span class="stat">›</span>
+      </button>`).join("");
+    el.querySelectorAll(".item").forEach((b) => {
+      b.addEventListener("click", () => { curDevice = devices.find((d) => d.deviceId === b.dataset.id); openSessions(); });
+    });
+  }
+
+  function openSessions() {
+    curSession = null; sessions = [];
+    $("dev-name").textContent = curDevice ? "🖥 " + curDevice.deviceName : "";
+    $("session-sub").textContent = "加载会话中…";
+    go("sessions");
+    fetchSessions();
+  }
+
+  async function fetchSessions() {
+    if (!curDevice) return;
+    const id = nextId();
+    send({ type: "list-sessions", msgId: id, deviceId: curDevice.deviceId });
+    // 服务端 20s 无应答则提示(设备可能刚离线)
+    setTimeout(() => { if (sessions.length === 0 && $("v-sessions").classList.contains("on")) $("session-sub").textContent = "暂无应答，设备可能已离线"; }, 20000);
+  }
+
+  function renderSessions() {
+    $("session-sub").textContent = curDevice ? curDevice.deviceName : "";
+    const el = $("seslist");
+    if (!sessions.length) { el.innerHTML = '<div class="empty">这台电脑还没有会话</div>'; return; }
+    el.innerHTML = sessions.map((s) => `
+      <button class="item" data-id="${esc(s.id)}">
+        <span style="flex:1;min-width:0"><span class="tt">${esc(s.title || "未命名会话")}</span>
+        <div class="sub">${esc((s.cwd || "") + (s.running ? " · 运行中" : ""))}</div></span>
+        <span class="stat">(${esc(s.ctxTok != null ? Math.round(s.ctxTok / 1000) + "k" : "-")})<br/>${hh(s.updatedAt)}</span>
+      </button>`).join("");
+    el.querySelectorAll(".item").forEach((b) => {
+      b.addEventListener("click", () => {
+        const s = sessions.find((x) => x.id === b.dataset.id);
+        if (s) openChat(s);
+      });
+    });
+  }
+
+  function openChat(s) {
+    curSession = s;
+    msgs = [];
+    lastAnsIndex = -1; pendingExec = null;
+    $("chat-title").textContent = s.title || "未命名会话";
+    $("chat-cwd").textContent = s.cwd || "";
+    renderMsgs();
+    go("chat");
+    hideBanner();
+    // 拉取近期上下文(设备把该会话末端实录回传,让手机看到之前对话)
+    send({ type: "open-session", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: s.id });
+    $("in-msg").focus();
+  }
+
+  function renderMsgs() {
+    const el = $("msgs");
+    el.innerHTML = msgs.map((m, i) => {
+      if (m.dir === "user") return `<div class="bubble user">${esc(m.text)}</div>`;
+      if (m.running) return `<div class="bubble ans running" data-i="${i}"><span class="running-dot">◌</span> 回答中…</div>`;
+      return `<div class="bubble ans" data-i="${i}">${esc(m.text)}</div>`;
+    }).join("");
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setBanner(t) { $("chat-banner").textContent = t; $("chat-banner").style.display = t ? "block" : "none"; }
+  const hideBanner = () => setBanner("");
+
+  // ---------- 执行(发消息) ----------
+  function doSend() {
+    const text = $("in-msg").value.trim();
+    if (!text || !curSession || !curDevice) return;
+    if (pendingExec) { toast("上一条还在回答中"); return; }
+    $("in-msg").value = "";
+    msgs.push({ dir: "user", text });
+    msgs.push({ dir: "ans", running: true, text: "" });
+    lastAnsIndex = msgs.length - 1;
+    renderMsgs();
+    const id = nextId();
+    pendingExec = id;
+    $("btn-stop").style.display = "inline-block";
+    send({ type: "exec", msgId: id, deviceId: curDevice.deviceId, sessionId: curSession.id, text });
+    // 兜底超时提示:30 分钟没回(电脑端 claude 某次回答特别长/卡死)给个提醒
+    setTimeout(() => {
+      if (pendingExec === id) toast("等待回答已很久，可点「停止」中断");
+    }, 30 * 60 * 1000);
+  }
+
+  function doStop() {
+    if (!curSession || !curDevice) return;
+    send({ type: "stop", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: curSession.id });
+    toast("已发送停止");
+  }
+
+  // ---------- WebSocket ----------
+  function connect() {
+    manualClose = false;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    const host = (hostInput.value || autoHost).trim().replace(/\/+$/, "");
+    token = (tokenInput.value || "").trim();
+    localStorage.setItem("cd-token", token);
+    localStorage.setItem("cd-host", host);
+
+    let url = host;
+    // 允许只填 ip:port / 主机:端口,自动补 ws:// 前缀与 /ws 路径
+    if (!/^wss?:\/\//i.test(url)) url = "ws://" + url;
+    if (!/\/ws$/i.test(url)) url += (url.endsWith("/") ? "" : "/") + "ws";
+
+    $("btn-connect").disabled = true;
+    $("btn-connect").textContent = "连接中…";
+
+    let created = false;
+    try { ws = new WebSocket(url); created = true; } catch (e) {
+      toast("地址无效：" + e.message); $("btn-connect").disabled = false; $("btn-connect").textContent = "连接"; return;
+    }
+
+    ws.onopen = () => {
+      retry = 0;
+      send({ type: "hello", role: "phone", token });
+    };
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === "welcome") {
+        if (!m.ok) { toast(m.error || "连接失败"); try { ws.close(); } catch {} return; }
+        $("btn-connect").textContent = "已连接 ✓";
+        hideBanner();
+        devices = m.devices || [];
+        renderDevices();
+        go("devices");
+      } else if (m.type === "devices") {
+        devices = m.devices || [];
+        if ($("v-devices").classList.contains("on")) renderDevices();
+        // 若停在会话/对话页,提示设备上下线
+        if (curDevice) {
+          const alive = devices.some((d) => d.deviceId === curDevice.deviceId);
+          if (!alive) { setBanner("所选电脑已离线，请返回重选"); }
+        }
+      } else if (m.type === "sessions") {
+        sessions = m.sessions || [];
+        renderSessions();
+      } else if (m.type === "session-info") {
+        if (curSession && m.sessionId === curSession.id) {
+          const box = $("chat-ctx");
+          box.style.display = "block";
+          box.textContent = m.tail ? "—— 电脑端该会话最近记录 ——\n" + m.tail : "（该会话还没有对话记录，发出的消息会同步到电脑端）";
+        }
+      } else if (m.type === "result") {
+        if (m.msgId === pendingExec) {
+          pendingExec = null;
+          $("btn-stop").style.display = "none";
+          if (lastAnsIndex >= 0 && msgs[lastAnsIndex]) {
+            if (m.ok) {
+              msgs[lastAnsIndex].running = false;
+              msgs[lastAnsIndex].text = m.text || "(空回复)";
+            } else {
+              msgs[lastAnsIndex] = { dir: "ans", text: "⚠ " + (m.error || "执行失败"), running: false };
+              msgs[lastAnsIndex].err = true;
+            }
+            renderMsgs();
+          }
+        }
+      } else if (m.type === "answer") {
+        // stop / 其它受理类应答:仅提示
+        if (m.ok === false) toast(m.error || "操作失败");
+      }
+    };
+    ws.onclose = () => {
+      $("btn-connect").disabled = false; $("btn-connect").textContent = "连接";
+      if (manualClose) return;
+      // 自动重连:指数退避 1s → 30s 封顶
+      const wait = Math.min(1000 * Math.pow(2, retry), 30000);
+      retry = Math.min(retry + 1, 8);
+      if (curSession) setBanner("连接断开，" + Math.round(wait / 1000) + "s 后重连…");
+      reconnectTimer = setTimeout(() => connect(), wait);
+    };
+    ws.onerror = () => { /* 由 onclose 统一处理重连 */ };
+  }
+
+  // ---------- 事件绑定 ----------
+  $("btn-connect").onclick = connect;
+  $("btn-device-back").onclick = () => { manualClose = true; try { ws && ws.close(); } catch {} go("connect"); $("btn-connect").textContent = "连接"; };
+  $("btn-session-back").onclick = () => { renderDevices(); go("devices"); };
+  $("btn-chat-back").onclick = () => { pendingExec = null; curSession = null; renderSessions(); go("sessions"); };
+  $("btn-refresh-sessions").onclick = () => fetchSessions();
+  $("btn-send").onclick = doSend;
+  $("btn-stop").onclick = doStop;
+  $("in-msg").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doSend(); } });
+  tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+  hostInput.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+
+  // 手机上软键盘弹起时保证输入框可见
+  $("in-msg").addEventListener("focus", () => setTimeout(() => $("msgs").scrollTop = $("msgs").scrollHeight, 200));
+})();
+</script>
+</body>
+</html>
