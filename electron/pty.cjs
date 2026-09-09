@@ -10,9 +10,11 @@
 //     供右侧纪要面板回顾与 AI 深度总结使用
 const fs = require("fs");
 const os = require("os");
+const path = require("path");
 const pty = require("node-pty");
 const persistence = require("./persistence.cjs");
 const claude = require("./claude.cjs"); // 复用 tokenizeArgs / sanitizeUserTokens / claudeBin
+const contextmon = require("./contextmon.cjs"); // projectDirsOf:claude jsonl 落盘目录(含父级 git 根)
 const { cleanTranscript } = require("./transcript.cjs"); // TUI 装饰行清洗
 
 const sessions = new Map(); // sessionId -> { term, cwd, bin, args, raw, dirty, base }
@@ -32,12 +34,45 @@ function setEmit(fn) {
 // 去掉 ANSI 控制序列(对整个缓冲做,避免跨 chunk 的半截序列问题),保留可读文本
 const ANSI_RE = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d\/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 function stripAnsi(text) {
-  // 裸 \r 是 TUI 整屏重绘的「走行首重写」标记,不能直接丢弃(否则一帧屏内容并成
-  // 一条无换行的巨行,cleanTranscript 会把它当装饰线丢掉,实录随之成空)。
-  return String(text || "")
+  // 先删思考过程(dim 2 + italic 3 标记),再剥 ANSI。
+  // 思考内容(内心独白)用斜体+暗淡 SGR 包裹,与最终回答不同色,是唯一可靠的区分标记。
+  return stripThinking(String(text || ""))
     .replace(ANSI_RE, "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n");
+}
+
+// 删除 dim(2)/italic(3) 状态下的文本 —— Claude Code 用这套 SGR 标记思考过程,
+// 思考内容剥 ANSI 后会混进最终回答造成乱码,须在剥 ANSI 前按状态剔除。
+function stripThinking(raw) {
+  let out = "";
+  let dim = false, italic = false, last = 0;
+  const re = /\[([0-9;]*)m/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    if (!dim && !italic) out += raw.slice(last, m.index);
+    const params = (m[1] || "0").split(";").map(Number);
+    let i = 0;
+    while (i < params.length) {
+      const p = params[i];
+      if (p === 38 || p === 48) {
+        // 前景/背景色设置:38/48 后跟 5;N(256色) 或 2;R;G;B(RGB),整体跳过
+        if (params[i + 1] === 5) i += 3;
+        else if (params[i + 1] === 2) i += 5;
+        else i += 1;
+      } else {
+        if (p === 0) { dim = false; italic = false; }
+        else if (p === 2) dim = true;
+        else if (p === 3) italic = true;
+        else if (p === 22) dim = false;
+        else if (p === 23) italic = false;
+        i += 1;
+      }
+    }
+    last = re.lastIndex;
+  }
+  if (!dim && !italic) out += raw.slice(last);
+  return out;
 }
 
 // Windows 上 .cmd/.bat 不能直接 CreateProcess,需经 cmd /c 执行(claude.cmd 同理)
@@ -59,15 +94,83 @@ function doFlush(id, entry) {
   } catch {}
 }
 
-// 后台节流:运行中的终端每 FLUSH_MS 落盘一次实录(有新增才写)
+// 后台节流:运行中的终端每 FLUSH_MS 落盘一次实录(有新增才写);顺带兜底捕获 session id
 setInterval(() => {
   for (const [id, entry] of sessions) {
+    if (entry && !entry.claudeId) captureClaudeId(id, entry);
     if (entry && entry.dirty) {
       entry.dirty = false;
       doFlush(id, entry);
     }
   }
 }, FLUSH_MS);
+
+// ---- claude session id 捕获(「恢复对话」的数据源) ----
+// 新终端启动后,claude 会在项目 slug 目录创建 <sessionId>.jsonl。用「启动前快照 + 之后新出现的
+// 文件」锁定本会话的 jsonl(文件名即 session id),落盘到会话记录的 claudeSessions 列表。
+// 只在【未锁定】时捕获:同目录可能有其它 claude(外部终端/别的应用会话)并发写 jsonl,
+// 锁定后不再跟随新文件,避免把外部会话误记到自己名下(/clear 换新文件的场景接受遗漏)。
+const claudeIds = new Map(); // appSessionId -> 当前锁定的 claude session id(占用映射,防重复 resume)
+
+function snapshotJsonls(cwd) {
+  // 本项目现有 jsonl 集合:按 jsonl 内 cwd 字段精确归属,Win(slug 规则不同)/父级 git 根落盘都覆盖
+  return new Set(contextmon.sessionFilesOf(cwd).map((f) => f.file));
+}
+
+function lockClaude(id, entry, file) {
+  const cid = path.basename(file, ".jsonl");
+  if (!cid || entry.claudeId === cid) return;
+  entry.claudeId = cid;
+  claudeIds.set(id, cid);
+  persistence.addClaudeSession(id, cid);
+}
+
+// 未锁定时轮询:快照之后新出现且 mtime 不早于启动时刻的 .jsonl 即本会话。
+// 扫描范围是 projects 全目录(Win 上算不出 claude 实际落盘的 slug 目录,只能全扫),
+// 故锁定前必须按 jsonl 内 cwd 字段确认是本项目会话——同机其它项目的 claude 恰好
+// 同刻新起会话时防误锁;多个候选取 mtime 最新且归属本项目的第一个。
+function captureClaudeId(id, entry) {
+  if (entry.claudeId || !entry.known) return;
+  const fresh = [];
+  const root = path.join(os.homedir(), ".claude", "projects");
+  let dirs = [];
+  try {
+    dirs = fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(root, e.name));
+  } catch {}
+  for (const dir of dirs) {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!n.endsWith(".jsonl")) continue;
+      const p = path.join(dir, n);
+      if (entry.known.has(p)) continue;
+      let mt = 0;
+      try {
+        mt = fs.statSync(p).mtimeMs;
+      } catch {
+        continue;
+      }
+      if (mt < entry.bornAt - 3000) continue; // 启动前就在写的旧文件(快照竞态),不是本会话
+      fresh.push({ p, mt });
+    }
+  }
+  for (const f of fresh) entry.known.add(f.p); // 无论归属与否都进快照,避免反复校验
+  if (!fresh.length) return;
+  fresh.sort((a, b) => b.mt - a.mt);
+  const target = contextmon.normPath(path.resolve(entry.cwd));
+  for (const f of fresh) {
+    if (contextmon.normPath(contextmon.cwdOfJsonl(f.p, f.mt)) !== target) continue;
+    lockClaude(id, entry, f.p);
+    return;
+  }
+}
 
 // 交互模式参数清洗:sanitizeUserTokens 会把 --resume <id> 连同其值一起剥掉(headless 需要
 // 防止覆盖它自己拼的必需参数)。但交互模式没有"必需参数"需保护,且 --resume <id> 是恢复
@@ -95,7 +198,7 @@ function ptySanitize(tokens) {
 function open(sessionId, opts = {}) {
   if (sessions.has(sessionId)) {
     const ex = sessions.get(sessionId);
-    return { ok: true, replay: ex.raw || "", running: true, args: ex.args };
+    return { ok: true, replay: ex.raw || "", running: true, args: ex.args, fresh: false };
   }
   const cwd = (opts.cwd || "").trim() || os.homedir();
   let isDir = false;
@@ -111,7 +214,29 @@ function open(sessionId, opts = {}) {
   const args = ptySanitize(claude.tokenizeArgs(opts.argText || ""));
   // 会话创建时勾选「跳过权限确认」→ 显式补上该 flag(终端形态同样生效)
   if (opts.skipPermissions) args.push("--dangerously-skip-permissions");
+  // 恢复对话:三选弹窗选定 --resume <id>。启动前校验 jsonl 还在(claude 对不存在的 id 直接报错
+  // 退出);失效则从会话历史剔除、按全新对话起。显式 resume 优先,剔除用户 argText 里手写的 --resume 防冲突
+  let resumeId = String(opts.resumeId || "").trim();
+  let resumeFile = "";
+  if (resumeId) {
+    // 按 jsonl 内 cwd 字段全量找(跨平台;slug 目录猜法在 Win 上不适用)
+    const found = contextmon.sessionFilesOf(cwd).find((f) => f.id === resumeId);
+    if (found) resumeFile = found.file;
+    if (!resumeFile) {
+      persistence.removeClaudeSession(sessionId, resumeId);
+      resumeId = "";
+    }
+  }
+  if (resumeId) {
+    for (let i = args.length - 1; i >= 0; i--) {
+      if (args[i] === "--resume") args.splice(i, args[i + 1] && !args[i + 1].startsWith("-") ? 2 : 1);
+    }
+    args.push("--resume", resumeId);
+  }
   const { file, prefix } = execTarget(bin);
+  const bornAt = Date.now();
+  // 恢复已知 id 无需捕获;全新对话先快照现存 jsonl,之后新出现的文件即本会话
+  const known = resumeId ? null : snapshotJsonls(cwd);
 
   let term;
   try {
@@ -144,8 +269,14 @@ function open(sessionId, opts = {}) {
     raw: "",
     dirty: false,
     base: (persistence.getSession(sessionId)?.transcript) || "",
+    bornAt,
+    known,
+    claudeId: "",
   };
   sessions.set(sessionId, entry);
+  if (resumeFile) lockClaude(sessionId, entry, resumeFile); // 恢复对话:直接锁定已知 id
+  // 全新对话:jsonl 通常在启动 1~2s 内出现,早期密集捕几轮,之后由 FLUSH 间隔兜底
+  if (!resumeId) [1500, 4000, 9000, 20000].forEach((ms) => setTimeout(() => { if (sessions.has(sessionId)) captureClaudeId(sessionId, entry); }, ms));
   lastUserAt.delete(sessionId); // 新开终端,清掉历史提交标记
 
   term.onData((d) => {
@@ -156,6 +287,7 @@ function open(sessionId, opts = {}) {
   term.onExit(({ exitCode }) => {
     doFlush(sessionId, sessions.get(sessionId));
     sessions.delete(sessionId);
+    claudeIds.delete(sessionId);
     lastUserAt.delete(sessionId);
     persistence.setRunning(sessionId, false);
     emitFn({ type: "exit", id: sessionId, exitCode });
@@ -163,7 +295,7 @@ function open(sessionId, opts = {}) {
 
   persistence.setRunning(sessionId, true);
   emitFn({ type: "open", id: sessionId });
-  return { ok: true, replay: "", running: true, cwd, bin, args };
+  return { ok: true, replay: "", running: true, cwd, bin, args, fresh: true };
 }
 
 // 用户最近一次提交(回车)时刻,供纪要面板触发判定;会话开/关时同步清理,避免陈旧值误触发
@@ -201,6 +333,7 @@ function close(sessionId) {
     s.term.kill();
   } catch {}
   sessions.delete(sessionId);
+  claudeIds.delete(sessionId);
   persistence.setRunning(sessionId, false);
   return true;
 }
@@ -298,7 +431,7 @@ function compact(sessionId) {
 function interact(sessionId, text, opts = {}) {
   const s = sessions.get(sessionId);
   if (!s) return Promise.resolve({ error: "终端未运行，请先打开会话终端" });
-  const { idleMs = 3000, minMs = 1000 } = opts;
+  const { idleMs = 3000, minMs = 1000, timeoutMs = 120000 } = opts;
   const mark = s.raw.length;
   try {
     s.term.write(text);
@@ -311,10 +444,15 @@ function interact(sessionId, text, opts = {}) {
     let idleSince = started;
     let even = false; // 是否已出现过头一轮输出(预防把发送前的垫底字节当回答)
     let timer = null;
-    const finish = () => {
+    let killT = null;
+    const finish = (timeout) => {
       if (timer) clearTimeout(timer);
-      resolve({ ok: true, text: stripAnsi(s.raw.slice(mark)).replace(/\s+$/g, "").trim() });
+      if (killT) clearTimeout(killT);
+      resolve({ ok: true, text: stripAnsi(s.raw.slice(mark)).replace(/\s+$/g, "").trim(), timeout: !!timeout });
     };
+    // 绝对超时兜底:若 claude 卡在思考/IO 等待,写入后始终无新输出(even 不置真),
+    // 不靠 idle 判定会永久挂起 → 超时强制返回,由调用方(waitDone)再判是否真答完
+    killT = setTimeout(() => finish(true), timeoutMs);
     const tick = () => {
       const len = s.raw.length;
       const now = Date.now();
@@ -324,9 +462,9 @@ function interact(sessionId, text, opts = {}) {
         even = true;
       }
       // 已开始输出且最近 idle 满 idleMs、总体至少观察 minMs → 答完
-      if (even && now - idleSince >= idleMs && now - started >= minMs) return finish();
+      if (even && now - idleSince >= idleMs && now - started >= minMs) return finish(false);
       // 终端中途被关闭 → 立即结束,队列引擎会感知到停止
-      if (!sessions.has(sessionId)) return finish();
+      if (!sessions.has(sessionId)) return finish(false);
       timer = setTimeout(tick, 200);
     };
     tick();
@@ -348,4 +486,14 @@ function openCount() {
   return sessions.size;
 }
 
-module.exports = { setEmit, open, write, resize, close, isOpen, sizeOf, liveTranscript, command, rawOf, interact, compact, closeAll, openCount, lastUserAtOf };
+// 某 claude session 是否正被本应用【其它】终端占用:两个终端同时 resume 同一 id 会互写
+// 同一 jsonl(对话记录互串),恢复对话的候选列表据此禁选
+function busyClaudeIds(exceptId) {
+  const out = new Set();
+  for (const [sid, cid] of claudeIds) {
+    if (sid !== exceptId && cid) out.add(cid);
+  }
+  return out;
+}
+
+module.exports = { setEmit, open, write, resize, close, isOpen, sizeOf, liveTranscript, command, rawOf, interact, compact, closeAll, openCount, lastUserAtOf, busyClaudeIds };

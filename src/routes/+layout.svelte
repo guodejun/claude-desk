@@ -84,7 +84,7 @@
 <style>
   :global(*) { box-sizing: border-box; }
   /* 外层禁止滚动,滚动交给各内容容器(对话区/列表/设置页)自己处理 */
-  :global(html, body) { margin: 0; height: 100%; overflow: hidden; background: var(--bg); font-family: ui-sans-serif, system-ui, sans-serif; color: var(--text); }
+  :global(html, body) { margin: 0; height: 100%; overflow: clip; background: var(--bg); font-family: ui-sans-serif, system-ui, sans-serif; color: var(--text); }
 
   .wrap { display: flex; flex-direction: column; height: 100vh; }
   .nav { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface); flex: 0 0 auto; }

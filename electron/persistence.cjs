@@ -6,6 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const log = require("./log.cjs");
 
 let base = null; // sessions 目录
 let settingsPath = null;
@@ -26,11 +27,16 @@ function fileOf(id) {
   return path.join(base, `${id}.json`);
 }
 
-// 原子写:先写 <file>.tmp 再 rename,避免断电/崩溃留下半截文件
+// 原子写:先写 <file>.tmp 再 rename,避免断电/崩溃留下半截文件。
+// 写盘失败会静默丢消息,故 catch 后落日志(它是持久化关键路径)。
 function atomicWrite(file, text) {
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, text, "utf8");
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, text, "utf8");
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    log.log("warn", `persistence 原子写入失败: ${file} :: ${e && e.message}`);
+  }
 }
 
 function writeSession(s) {
@@ -41,7 +47,9 @@ function writeSession(s) {
 function readSessionFile(id) {
   try {
     return JSON.parse(fs.readFileSync(fileOf(id), "utf8"));
-  } catch {
+  } catch (e) {
+    // 文件不存在/损坏都会走到这:不存在是正常态(还没建过该会话),损坏才需要日志排查
+    if (e && e.code !== "ENOENT") log.log("warn", `persistence 读取会话失败: ${id} :: ${e.message}`);
     return null;
   }
 }
@@ -102,7 +110,10 @@ function deleteSession(id) {
   }
   try {
     fs.rmSync(fileOf(id));
-  } catch {}
+  } catch (e) {
+    // 删除失败不影响内存态缓存(已 cache.delete),仅记录提醒,避免会话成「僵尸文件」
+    log.log("warn", `persistence 删除会话文件失败: ${id} :: ${e && e.message}`);
+  }
 }
 
 function listSessions() {
@@ -112,7 +123,10 @@ function listSessions() {
   let files = [];
   try {
     files = fs.readdirSync(base).filter((f) => f.endsWith(".json"));
-  } catch {}
+  } catch (e) {
+    // 目录不存在/无权限时列表为空,会话将「消失」在列表页,需日志定位
+    log.log("warn", `persistence 读取会话目录失败: ${e && e.message}`);
+  }
   for (const f of files) {
     const id = f.slice(0, -5);
     const s = getSession(id);
@@ -215,6 +229,46 @@ function recordDone(id, claudeSessionId, model) {
   runningSet.delete(id);
   cache.set(id, s);
   flush(id); // 完成时立即落盘
+}
+
+// ---- claude 会话历史(恢复对话用) ----
+// 每个应用会话可对应多个 claude session(新对话 / /clear / 每次重开各产生一个)。
+// 列表最新在前,cap 10;claudeSessionId 始终指向最近一个(兼容上下文监控的精确查找)。
+function addClaudeSession(id, claudeId) {
+  const s = getSession(id);
+  if (!s || !claudeId) return;
+  s.claudeSessions = (Array.isArray(s.claudeSessions) ? s.claudeSessions : []).filter((x) => x && x.id !== claudeId);
+  s.claudeSessions.unshift({ id: claudeId, at: Date.now() });
+  if (s.claudeSessions.length > 10) s.claudeSessions = s.claudeSessions.slice(0, 10);
+  s.claudeSessionId = claudeId;
+  cache.set(id, s);
+  flush(id);
+}
+
+// 剔除失效的 claude session(jsonl 已被 /clear 或外部清理,resume 会让 claude 直接报错退出)
+function removeClaudeSession(id, claudeId) {
+  const s = getSession(id);
+  if (!s || !Array.isArray(s.claudeSessions)) return;
+  const next = s.claudeSessions.filter((x) => x && x.id !== claudeId);
+  if (next.length === s.claudeSessions.length) return;
+  s.claudeSessions = next;
+  if (s.claudeSessionId === claudeId) s.claudeSessionId = next.length ? next[0].id : null;
+  cache.set(id, s);
+  flush(id);
+}
+
+// 记录某会话已由 claude jsonl 同步上行的消息 id 集合(去重状态)。
+// 关键:getSession 可能返回「磁盘读出的临时对象」(不在 cache),直接改它再 flush 会因 cache.get 取不到而落盘失败,
+// 故这里统一 getSession→修改→cache.set→flush,与 appendMessage/recordDone 同模式,保证重启后去重状态仍在。
+function saveCloudUuids(id, uuids, seq) {
+  const s = getSession(id);
+  if (!s) return;
+  s.cloudUuids = Array.isArray(uuids) ? uuids.slice(0, 2000) : [];
+  // 一并落盘已上行到的 seq(upSeq 内存值),否则重启后 seq 从 1 重数会覆盖数据库已有消息
+  if (typeof seq === "number" && seq > 0) s.cloudSeq = seq;
+  s.updatedAt = Date.now();
+  cache.set(id, s);
+  flush(id);
 }
 
 // 压缩上下文:用一段摘要替换会话消息(降低本地持久化/显示的上下文量)
@@ -355,6 +409,9 @@ module.exports = {
   appendMessage,
   appendBlock,
   recordDone,
+  addClaudeSession,
+  removeClaudeSession,
+  saveCloudUuids,
   compactSession,
   setTranscript,
   setRunning,

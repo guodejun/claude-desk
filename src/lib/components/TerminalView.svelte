@@ -28,16 +28,58 @@
   let pending = [];
   let replaying = true;
 
-  // 打开/重连(幂等):进入会话目录+参数,已开则附带本轮原始字节 replay 供重放;
+  // ---- 恢复对话(三选) ----
+  // 进入会话/重连时先问候选:终端活着 → 直接重附着;有历史 claude session → 弹三选
+  // (继续上次 / 选历史 / 新对话),选完才真正 terminalOpen;无历史直接全新起。
+  let choosing = $state(false); // 是否正在展示「恢复对话」选择层
+  let candList = $state([]); // 历史 claude session 候选(含 busy/hot 标记)
+
+  async function attach() {
+    if (!term || !mounted) return;
+    err = "";
+    exited = false;
+    let cand = null;
+    try {
+      cand = await window.claude.terminalCandidates(id);
+    } catch {}
+    if (!mounted) return;
+    if (cand && !cand.running && Array.isArray(cand.sessions) && cand.sessions.length) {
+      candList = cand.sessions;
+      choosing = true;
+      return; // 等用户在选择层点选,chooseResume 里再真正开终端
+    }
+    openTerm("");
+  }
+
+  // 三选结果:resumeId 空 = 开始新对话;否则 --resume 恢复指定历史 session
+  function chooseResume(resumeId) {
+    choosing = false;
+    candList = [];
+    openTerm(resumeId || "");
+  }
+
+  // 历史 session 时间显示:今天/昨天 HH:mm,更早 M-DD HH:mm
+  function fmtAt(ms) {
+    const d = new Date(ms || 0);
+    if (!(d.getTime() > 0)) return "";
+    const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) return `今天 ${hm}`;
+    const y = new Date(now.getTime() - 86400000);
+    if (d.toDateString() === y.toDateString()) return `昨天 ${hm}`;
+    return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, "0")} ${hm}`;
+  }
+
+  // 真正打开/重连终端(幂等):进入会话目录+参数,已开则附带本轮原始字节 replay 供重放;
   // 进程退出(Ctrl+C 等)后可点重连,重新 terminalOpen 起一个真实 claude
-  function attach() {
+  function openTerm(resumeId) {
     if (!term || !mounted) return;
     err = "";
     exited = false;
     replaying = true;
     pending = [];
     window.claude
-      .terminalOpen(id)
+      .terminalOpen(id, resumeId || "")
       .then((r) => {
         if (r && r.error) {
           err = r.error;
@@ -206,6 +248,9 @@
   // 无历史可滚(alt 全屏 TUI / 内容不足一屏)或正在回看时由我们接管 → 上滚进历史回看
   function onHostWheel(e) {
     if (!term || !mounted) return;
+    // 恢复对话弹窗打开:滚轮全屏盖在 host 上,交给弹窗自己的滚动条(rs-list),
+    // 不能在这里 preventDefault 接管(capture 阶段拦截会卡死弹窗滚动)
+    if (choosing) return;
     let hasReal = false;
     try {
       hasReal = term.buffer.active.baseY > 0;
@@ -472,6 +517,31 @@
     <div class="errbar" data-testid="term-err">⚠ {err}</div>
   {:else}
     <div class="host" bind:this={host} oncontextmenu={onHostCtx}>
+      {#if choosing && candList.length}
+        <!-- 恢复对话三选:继续上次 / 选历史(可多条) / 开始新对话。busy=本应用另一终端占用(禁选);hot=疑似外部 claude 在跑(警告) -->
+        <div class="rs" data-testid="resume-dialog">
+          <div class="rs-box">
+            <div class="rs-title">恢复对话</div>
+            <div class="rs-sub">该会话有 {candList.length} 个历史 claude 对话，选择恢复方式</div>
+            <button class="rs-primary" data-testid="resume-latest" onclick={() => chooseResume(candList[0].id)} disabled={candList[0].busy}>
+              <span class="rs-head">▶ 继续上次对话{#if candList[0].busy}<em class="rs-tag busy">⚠ 另一终端运行中</em>{:else if candList[0].hot}<em class="rs-tag">⚠ 可能外部运行中</em>{/if}</span>
+              <span class="rs-meta">{fmtAt(candList[0].at)}{candList[0].firstPrompt ? " · " + candList[0].firstPrompt : ""}</span>
+            </button>
+            {#if candList.length > 1}
+              <div class="rs-list">
+                {#each candList.slice(1) as s (s.id)}
+                  <button class="rs-item" data-testid="resume-item" onclick={() => chooseResume(s.id)} disabled={s.busy} title={s.busy ? "该对话正在另一个终端中运行" : "恢复这个对话"}>
+                    <span class="rs-time">{fmtAt(s.at)}</span>
+                    <span class="rs-prompt">{s.firstPrompt || "(无提问记录)"}</span>
+                    {#if s.busy}<em class="rs-tag busy">⚠ 运行中</em>{:else if s.hot}<em class="rs-tag">⚠ 外部?</em>{/if}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+            <button class="rs-new" data-testid="resume-new" onclick={() => chooseResume("")}>✚ 开始新对话</button>
+          </div>
+        </div>
+      {/if}
       {#if ctxMenu}
         <!-- 右键菜单(复制/粘贴,覆盖 TUI 整屏重绘选不中文案的痛点) -->
         <div class="cm-mask" onclick={closeMenu} oncontextmenu={(e) => { e.preventDefault(); closeMenu(); }}></div>
@@ -511,10 +581,34 @@
 
 <style>
   .wrap { position: relative; height: 100%; display: flex; flex-direction: column; background: #0d1117; }
-  .host { position: relative; flex: 1 1 auto; min-height: 0; padding: 6px 8px 0; }
+  .host { position: relative; flex: 1 1 auto; min-height: 0; padding: 6px 8px 0; overflow: clip; /* clip:xterm IME textarea 组合期定位在光标处,防止 Chromium 为「露出」它而滚动本容器 */ }
   .host :global(.xterm) { height: 100%; }
   /* 禁用 xterm 自绘滚动条(monaco slider 在 alt 屏恒 0 高失效,且与我们自绘条重复),统一用 .sb */
   .host :global(.xterm-scrollable-element > .scrollbar) { display: none !important; }
+  /* 禁用 xterm 6 装饰概览标尺(xterm-decoration-overview-ruler):它按 xterm 主题背景色渲染,
+     浅色主题下是白色 8px 竖条,出现在终端右缘内侧(win 用户报的「白线」);本项目未用搜索装饰,直接隐藏 */
+  .host :global(.xterm-decoration-overview-ruler) { display: none !important; }
+  /* 恢复对话三选层:盖在终端区上方,卡片式三选(继续上次/历史列表/新对话) */
+  .host .rs { position: absolute; inset: 0; z-index: 6; background: rgba(13, 17, 23, .96); display: flex; align-items: center; justify-content: center; }
+  .host .rs-box { width: min(480px, 92%); background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 18px; box-shadow: 0 12px 40px rgba(0, 0, 0, .5); }
+  .host .rs-title { font-size: 15px; font-weight: 600; color: #e6edf3; }
+  .host .rs-sub { font-size: 12px; color: #8b949e; margin: 6px 0 14px; }
+  .host .rs-primary { width: 100%; text-align: left; background: rgba(88, 166, 255, .12); border: 1px solid rgba(88, 166, 255, .4); color: #e6edf3; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-size: 13px; display: flex; flex-direction: column; gap: 4px; overflow: hidden; /* 裁剪 flex 子项溢出:nowrap 长文本会把子项盒撑出卡片右缘(实测 rs-meta 560>父 442) */ }
+  .host .rs-primary:hover:not(:disabled) { background: rgba(88, 166, 255, .2); border-color: #58a6ff; }
+  .host .rs-primary:disabled { opacity: .55; cursor: not-allowed; }
+  .host .rs-head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  /* min-width:0 是关键:flex item 默认 min-width:auto,nowrap 长文本会把自己撑出弹窗,省略号失效 */
+  .host .rs-meta { font-size: 11.5px; color: #8b949e; font-weight: 400; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .host .rs-list { margin-top: 10px; max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .host .rs-item { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: #1c2128; border: 1px solid #30363d; color: #e6edf3; border-radius: 8px; padding: 8px 10px; cursor: pointer; font-size: 12.5px; }
+  .host .rs-item:hover:not(:disabled) { border-color: #58a6ff; }
+  .host .rs-item:disabled { opacity: .55; cursor: not-allowed; }
+  .host .rs-time { color: #8b949e; flex: 0 0 auto; font-size: 11.5px; }
+  .host .rs-prompt { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .host .rs-tag { flex: 0 0 auto; font-size: 11px; font-style: normal; color: #d29922; font-weight: 400; }
+  .host .rs-tag.busy { color: #ff7b72; }
+  .host .rs-new { margin-top: 12px; width: 100%; background: transparent; border: 1px dashed #30363d; color: #8b949e; border-radius: 8px; padding: 9px 12px; cursor: pointer; font-size: 12.5px; }
+  .host .rs-new:hover { color: #58a6ff; border-color: #58a6ff; }
   /* 右键菜单:fixed 覆盖层 + 自绘小菜单,与应用其它弹窗统一的暗色圆角风格;点击任意处/再右键关闭 */
   .host .cm-mask { position: fixed; inset: 0; z-index: 9; }
   .host .cm { position: fixed; z-index: 10; min-width: 148px; background: #1c2128; border: 1px solid #30363d; border-radius: 8px; padding: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, .45); }

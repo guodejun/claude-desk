@@ -248,9 +248,11 @@
 
   /* 主体:终端占满剩余高度 + 可选右侧纪要(1/4) */
   .main-row { flex: 1 1 auto; min-height: 0; display: flex; }
-  .term-col { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .term-col { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; overflow: clip; /* clip 而非 hidden:不创建滚动容器,IME 组合时 Chromium 无法程序滚动它(对话区左移根因之一) */ }
   .main-row.with-panel .term-col { flex-basis: 72%; }
-  .summary-col { flex: 0 0 28%; min-width: 260px; max-width: 520px; border-left: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; min-height: 0; }
+  /* border-left 固定深色不用 var(--border):终端区硬编码深色(#0d1117),浅色主题下
+     变量值 #d0d7de 是浅灰,在黑终端旁呈显眼「白线」(win 实测);深色线两主题都融入终端边缘 */
+  .summary-col { flex: 0 0 28%; min-width: 260px; max-width: 520px; border-left: 1px solid #21262d; background: var(--surface); display: flex; flex-direction: column; min-height: 0; }
 
   .modal { position: fixed; inset: 0; background: var(--overlay); display: flex; align-items: center; justify-content: center; z-index: 60; }
   .card { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px; width: 560px; max-width: 92vw; max-height: 86vh; overflow-y: auto; padding: 18px 20px; }

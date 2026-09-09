@@ -1,6 +1,6 @@
 {
   "name": "claude-desk",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "可视化 Claude Code 会话窗口(基于真实 claude headless)",
   "type": "module",
   "main": "electron/main.cjs",

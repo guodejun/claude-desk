@@ -31,12 +31,148 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+// 对话历史库:MySQL 存 sessions/messages 表。
+// 手机端打开会话直接从服务器读历史,设备离线也能看;桌面端把每次对话消息上行入库。
+// 连接优先级:环境变量 RELAY_DB_* > config.json 的 db 字段 > 下方缺省(与服务器同机部署)。
+const mysql = require("mysql2/promise");
+
+let pool = null;
+async function initDb() {
+  if (pool) return;
+  const cfg = {
+    host: process.env.RELAY_DB_HOST || (config.db && config.db.host) || "127.0.0.1",
+    port: Number(process.env.RELAY_DB_PORT || (config.db && config.db.port) || 3306),
+    user: process.env.RELAY_DB_USER || (config.db && config.db.user) || "cd_relay",
+    password: process.env.RELAY_DB_PASS || (config.db && config.db.password) || "",
+    database: process.env.RELAY_DB_DATABASE || (config.db && config.db.database) || "claude_desk_relay",
+    connectionLimit: 5,
+    charset: "utf8mb4",
+    dateStrings: true,
+  };
+  pool = mysql.createPool(cfg);
+  // 建表:id 主键、(session_id, seq) 唯一,桌面端按 seq 递增 upsert,天然幂等。
+  // 会话表:一条记录对应电脑端/手机端共享的一个 claude 会话
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id VARCHAR(128) PRIMARY KEY COMMENT '会话ID(UUID,与电脑端一致)',
+      device_id VARCHAR(128) COMMENT '所属设备ID(电脑端设备标识)',
+      title TEXT COMMENT '会话标题',
+      cwd TEXT COMMENT '会话工作目录',
+      created_at BIGINT COMMENT '创建时间(毫秒时间戳)',
+      updated_at BIGINT COMMENT '最后更新时间(毫秒时间戳)'
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话元信息表'
+  `);
+  // 消息表:一个会话的全部对话消息,按 seq 递增 upsert 幂等,PC 与手机读到同一份
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+      session_id VARCHAR(128) COMMENT '所属会话ID(对应 sessions.id)',
+      device_id VARCHAR(128) COMMENT '上报设备ID',
+      seq INT COMMENT '会话内消息序号(自 1 递增,与 session_id 组成唯一键)',
+      role VARCHAR(32) COMMENT '消息角色:user(用户)/assistant(claude回答)/ui(系统提示)',
+      text LONGTEXT COMMENT '消息纯文本(正文摘要,完整结构见 blocks)',
+      blocks LONGTEXT COMMENT '结构化消息块(JSON数组,含 text/error 等块类型)',
+      message_id VARCHAR(128) COMMENT '桌面端消息ID(同一回答的多个块据此合并成一条)',
+      ts BIGINT COMMENT '消息时间戳(毫秒)',
+      status VARCHAR(32) COMMENT '回答状态:running(回答中)/awaiting(停在选择器)/done(完成)',
+      type VARCHAR(32) COMMENT '回答类型:text(普通)/choice(单选方案)/checkbox(复选框,预留)',
+      options LONGTEXT COMMENT '选择器选项(JSON数组,[{key,label}],type=choice 时使用)',
+      UNIQUE KEY uk_session_seq (session_id, seq)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对话消息表'
+  `);
+  log("db 初始化:mysql", `${cfg.host}:${cfg.port}/${cfg.database}`);
+}
+
+// upsert 会话元信息(桌面端建会话/改名时上报)
+async function dbUpsertSession(deviceId, s) {
+  if (!pool || !s || !s.id) return;
+  try {
+    await pool.query(`
+      INSERT INTO sessions (id, device_id, title, cwd, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE title=VALUES(title), cwd=VALUES(cwd), updated_at=VALUES(updated_at)
+    `, [
+      String(s.id),
+      String(deviceId || ""),
+      String(s.title || ""),
+      String(s.cwd || ""),
+      Number(s.createdAt) || Date.now(),
+      Number(s.updatedAt) || Date.now(),
+    ]);
+  } catch (e) {
+    log("dbUpsertSession 失败:", e && e.message);
+  }
+}
+
+// upsert 一条消息(桌面端已聚合好的权威结构 {role,text,blocks,messageId,ts,status,type,options})
+async function dbUpsertMessage(deviceId, sessionId, seq, msg) {
+  if (!pool || !sessionId) return;
+  const m = msg || {};
+  try {
+    await pool.query(`
+      INSERT INTO messages (session_id, device_id, seq, role, text, blocks, message_id, ts, status, type, options)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        role=VALUES(role), text=VALUES(text), blocks=VALUES(blocks),
+        message_id=VALUES(message_id), ts=VALUES(ts),
+        status=VALUES(status), type=VALUES(type), options=VALUES(options)
+    `, [
+      String(sessionId),
+      String(deviceId || ""),
+      Number(seq) || 0,
+      String(m.role || ""),
+      m.text != null ? String(m.text) : "",
+      m.blocks ? JSON.stringify(m.blocks) : null,
+      m.messageId != null ? String(m.messageId) : null,
+      Number(m.ts) || Date.now(),
+      m.status != null ? String(m.status) : null,
+      m.type != null ? String(m.type) : null,
+      m.options ? JSON.stringify(m.options) : null,
+    ]);
+  } catch (e) {
+    log("dbUpsertMessage 失败:", e && e.message);
+  }
+}
+
+// 读一个会话的历史消息(按 seq 升序),blocks/options 反序列化回数组。
+// afterSeq 为增量水位:大于它才取,且每次最多 LIMIT 500 条,供手机端按 seq 增量轮询,
+// 避免长会话每次拉全量(可达 MB 级)。无 afterSeq 时全量返回(兼容旧客户端/首屏)。
+async function dbGetMessages(sessionId, afterSeq) {
+  if (!pool) return [];
+  try {
+    const isIncr = Number.isFinite(afterSeq) && afterSeq > 0;
+    const [rows] = await pool.query(
+      isIncr
+        ? "SELECT * FROM messages WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT 500"
+        : "SELECT * FROM messages WHERE session_id=? ORDER BY seq ASC",
+      isIncr ? [String(sessionId), Number(afterSeq)] : [String(sessionId)]
+    );
+    return rows.map((r) => ({
+      seq: r.seq,
+      role: r.role,
+      text: r.text || "",
+      blocks: r.blocks ? JSON.parse(r.blocks) : undefined,
+      messageId: r.message_id || null,
+      ts: r.ts,
+      status: r.status || null,
+      type: r.type || null,
+      options: r.options ? JSON.parse(r.options) : undefined,
+    }));
+  } catch (e) {
+    // 历史读取失败会让手机端「打开会话/轮询」拿不到数据,必须留日志
+    log("dbGetMessages 失败:", e && e.message);
+    return [];
+  }
+}
 
 // ---- 配置:env > 命令行 > config.json;token 缺省自动生成并持久化 ----
 let config = {};
 try {
   config = JSON.parse(fs.readFileSync(path.join(__dirname, "config.json"), "utf8"));
-} catch {}
+} catch (e) {
+  // 首次启动没有 config.json 属常态,由下方自动生成;其他读取失败才记日志说明用了缺省端口
+  if (e && e.code !== "ENOENT") log("config.json 读取失败,使用缺省配置:", e && e.message);
+}
 const argv = process.argv.slice(2);
 const FLAG = (name) => {
   const i = argv.indexOf(name);
@@ -50,7 +186,10 @@ if (!token) {
   config.port = port;
   try {
     fs.writeFileSync(path.join(__dirname, "config.json"), JSON.stringify(config, null, 2));
-  } catch {}
+  } catch (e) {
+    // 写回失败只影响下次启动自动读取,不阻断本次运行,但必须留日志提醒(否则 token 会换)
+    log("回写 config.json 失败(下次启动 token 可能变化):", e && e.message);
+  }
   console.log("\n  ⚠ 未配置 token,已自动生成(已写入 server/config.json):");
   console.log(`    ${token}\n`);
 }
@@ -83,7 +222,8 @@ function broadcastDevices() {
 
 // 路由:手机的请求 → 对应设备的 ws;设备的应答 → 发起请求的那个手机
 function isRequest(m) {
-  return ["list-sessions", "open-session", "exec", "stop"].includes(m.type);
+  // choose:手机点选 claude 原生选择器的某项,转发给设备注入「方向键×N+回车」
+  return ["list-sessions", "open-session", "exec", "choose", "stop", "new-session", "close-session"].includes(m.type);
 }
 function forwardToDevice(ws, m) {
   const dev = devices.get(m.deviceId);
@@ -153,10 +293,27 @@ wss.on("connection", (ws, req) => {
       if (m.type === "list-devices") {
         const list = [...devices.values()].map((d) => ({ deviceId: d.deviceId, deviceName: d.name, online: true, since: d.since, ip: d.ip }));
         ws.send(JSON.stringify({ type: "devices", msgId: m.msgId, devices: list }));
+      } else if (m.type === "messages") {
+        // 手机端直接读服务器历史(不转发设备):设备离线也能看已入库的对话记录。
+        // 带 afterSeq 则只回 seq>afterSeq 的增量(每 5s 轮询),否则全量(首屏/旧客户端)。
+        dbGetMessages(m.sessionId, m.afterSeq).then((messages) => {
+          ws.send(JSON.stringify({ type: "messages", msgId: m.msgId, sessionId: m.sessionId, messages, afterSeq: m.afterSeq }));
+        }).catch((e) => {
+          log("dbGetMessages 承诺拒绝:", e && e.message);
+          ws.send(JSON.stringify({ type: "messages", msgId: m.msgId, sessionId: m.sessionId, messages: [], afterSeq: m.afterSeq }));
+        });
       } else if (isRequest(m)) {
         forwardToDevice(ws, m);
       }
     } else if (ws.role === "device") {
+      // 设备上行:把会话元信息 / 对话消息落库(不带 msgId,不路由回手机,直接 return)
+      if (m.type === "db-session") {
+        dbUpsertSession(ws.deviceId, m.session);
+        return;
+      } else if (m.type === "db-message") {
+        dbUpsertMessage(ws.deviceId, m.sessionId, m.seq, m.message);
+        return;
+      }
       // 设备应答:带 msgId 的即路由回对应手机(实体数据透传,server 不解析内容)
       if (m.msgId && pending.has(m.msgId)) {
         const p = pending.get(m.msgId);
@@ -226,12 +383,17 @@ server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
+// 初始化 MySQL 连接池与建表;连接失败也照常起 relay(仅历史读写不可用),避免整站挂掉
+initDb().catch((e) => log("db 初始化失败(历史读写不可用):", e && e.message));
+
 server.listen(port, () => {
+  const dbName = (config.db && config.db.database) || process.env.RELAY_DB_DATABASE || "claude_desk_relay";
   console.log("┌──────────────────────────────────────────────");
   console.log("│  Claude Desk 云中转服务已启动");
   console.log(`│  地址: http://0.0.0.0:${port}  (手机浏览器访问 = H5 遥控页)`);
   console.log(`│  服务: ws://<公网IP>:${port}/ws`);
   console.log(`│  token: ${token}`);
+  console.log(`│  历史库: MySQL @ ${dbName}`);
   console.log("│  电脑端设置里填同一条地址与 token 即可连接");
   console.log("└──────────────────────────────────────────────");
 });

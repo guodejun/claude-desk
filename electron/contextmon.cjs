@@ -15,6 +15,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const persistence = require("./persistence.cjs");
+const log = require("./log.cjs");
 
 // 估算:约 1/3 token/字符(中英混合) + 系统提示/工具预置开销
 const CH_TOK = 3;
@@ -26,6 +27,136 @@ function projectDirOf(cwd) {
   let s = String(cwd || "").replace(/^\/+/, "");
   if (!s) s = os.homedir().replace(/^\/+/, "");
   return path.join(os.homedir(), ".claude", "projects", "-" + s.replace(/\//g, "-"));
+}
+
+// 某 cwd 的「可能落 jsonl 的 slug 目录」列表:cwd 自身 slug + 向上各级 git 根的 slug。
+// 实测 attach 的 claude 会把项目 jsonl 写在非 cwd slug 的目录(如父级 git 根),
+// 捕获 session id / 列候选 session 时须一并扫描,但又不做全盘扫(会命中其它项目会话)。
+function projectDirsOf(cwd) {
+  const dirs = [];
+  const seen = new Set();
+  const push = (d) => {
+    const p = projectDirOf(d);
+    if (!seen.has(p)) { seen.add(p); dirs.push(p); }
+  };
+  let cur = path.resolve(String(cwd || "") || os.homedir());
+  push(cur);
+  const home = path.resolve(os.homedir());
+  // 向上找含 .git 的祖先目录(含 cwd 本身),最多走到 home,每层都补一个 slug
+  for (let i = 0; i < 12; i++) {
+    try {
+      if (fs.existsSync(path.join(cur, ".git"))) push(cur);
+    } catch {}
+    const parent = path.dirname(cur);
+    if (parent === cur || cur === home || parent.length < home.length) break;
+    cur = parent;
+  }
+  return dirs;
+}
+
+// 路径比较规范化:统一 / 分隔、去尾斜杠(Win 上 claude 记的 cwd 可能是 \ 分隔)
+function normPath(p) {
+  return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+// 从 jsonl 头部提取 claude 记录的启动目录(除 summary 行外各行基本都带 cwd 字段)。
+// 这是判断「文件属于哪个项目」的最可靠依据,胜过猜 slug 目录名:
+// Win 上 slug 规则不同(盘符/反斜杠),且 attach 会话会把 jsonl 落父级 git 根 slug。
+const cwdCache = new Map(); // file -> { at, cwd }:mtime 不变直接复用,避免列候选时反复读盘
+function cwdOfJsonl(file, at) {
+  const c = cwdCache.get(file);
+  if (c && c.at === at) return c.cwd;
+  let cwd = "";
+  try {
+    const fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(65536);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    for (const line of buf.slice(0, n).toString("utf8").split("\n")) {
+      if (!line || line.indexOf('"cwd"') < 0) continue;
+      try {
+        const o = JSON.parse(line);
+        if (o && typeof o.cwd === "string" && o.cwd) {
+          cwd = o.cwd;
+          break;
+        }
+      } catch {}
+    }
+  } catch {}
+  cwdCache.set(file, { at, cwd });
+  if (cwdCache.size > 3000) cwdCache.delete(cwdCache.keys().next().value); // 简易 LRU 防胀
+  return cwd;
+}
+
+// 某 cwd 的 claude 会话文件全量列表:[{ id, file, at }] 按 mtime 倒序。
+// 查找范围:slug 目录快路径(projectDirsOf);全部不存在时(如 Win slug 规则不符)回退为
+// 扫 projects 下所有目录、用目录内最新 jsonl 的 cwd 字段认领整目录。所有文件最终逐个按
+// cwd 字段校验 == 本 cwd —— git 根 slug 目录会混同根下其它子项目的会话,必须过滤。
+function sessionFilesOf(cwd) {
+  const target = normPath(path.resolve(String(cwd || "") || os.homedir()));
+  const dirs = [];
+  for (const d of projectDirsOf(cwd)) {
+    try {
+      if (fs.existsSync(d)) dirs.push(d);
+    } catch {}
+  }
+  if (!dirs.length) {
+    const root = path.join(os.homedir(), ".claude", "projects");
+    let entries = [];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {}
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const dir = path.join(root, e.name);
+      let names = [];
+      try {
+        names = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      // 目录归属判定:取最新一个 jsonl 读 cwd(同 slug 目录的会话同属一个项目路径)
+      let newest = "";
+      let newestAt = -1;
+      for (const n of names) {
+        if (!n.endsWith(".jsonl")) continue;
+        let at = 0;
+        try {
+          at = fs.statSync(path.join(dir, n)).mtimeMs;
+        } catch {
+          continue;
+        }
+        if (at > newestAt) {
+          newestAt = at;
+          newest = n;
+        }
+      }
+      if (newest && normPath(cwdOfJsonl(path.join(dir, newest), newestAt)) === target) dirs.push(dir);
+    }
+  }
+  const out = [];
+  for (const dir of dirs) {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!n.endsWith(".jsonl")) continue;
+      const p = path.join(dir, n);
+      let at = 0;
+      try {
+        at = fs.statSync(p).mtimeMs;
+      } catch {
+        continue;
+      }
+      if (normPath(cwdOfJsonl(p, at)) !== target) continue; // 同 slug 目录里其它子项目的会话,剔除
+      out.push({ id: n.slice(0, -".jsonl".length), file: p, at });
+    }
+  }
+  out.sort((a, b) => b.at - a.at);
+  return out;
 }
 
 // 找某会话的 jsonl:
@@ -58,7 +189,10 @@ function findJsonlById(id) {
       const p = path.join(base, d, id + ".jsonl");
       if (fs.existsSync(p)) return p;
     }
-  } catch {}
+  } catch (e) {
+    // 找不到 jsonl 会让消息提取/云上行静默跳过,故非目录不存在(ENOENT)的异常要记日志
+    if (e && e.code !== "ENOENT") log.log("warn", `contextmon 查找 jsonl 失败: ${id} :: ${e.message}`);
+  }
   return null;
 }
 
@@ -72,7 +206,9 @@ function findNewestAnywhere() {
       const p = latestJsonl(path.join(base, d));
       if (p && p.mt > bt) { best = p.f; bt = p.mt; }
     }
-  } catch {}
+  } catch (e) {
+    if (e && e.code !== "ENOENT") log.log("warn", `contextmon 全盘扫描 jsonl 失败 :: ${e.message}`);
+  }
   return best;
 }
 
@@ -83,7 +219,9 @@ function latestJsonl(dir) {
       .map((f) => ({ f: path.join(dir, f), mt: fs.statSync(path.join(dir, f)).mtimeMs }))
       .sort((a, b) => b.mt - a.mt);
     return files[0] || null;
-  } catch {
+  } catch (e) {
+    // 目录不存在(ENOENT)是常态,静默;其余(权限等)才记日志
+    if (e && e.code !== "ENOENT") log.log("warn", `contextmon 读取 jsonl 目录失败: ${dir} :: ${e.message}`);
     return null;
   }
 }
@@ -253,4 +391,4 @@ function contextState(id) {
   };
 }
 
-module.exports = { contextState, projectDirOf, maxOf, fmt, findSessionJsonl, scanJsonl };
+module.exports = { contextState, projectDirOf, projectDirsOf, maxOf, fmt, findSessionJsonl, scanJsonl, normPath, cwdOfJsonl, sessionFilesOf };

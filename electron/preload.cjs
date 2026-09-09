@@ -66,7 +66,9 @@ contextBridge.exposeInMainWorld("claude", {
   // 会话事件总线(主→渲染):ev={type:'start'|'user-message'|'stream'|'done'|'error', id, ...}
   onSession: (cb) => ipcRenderer.on("session-event", (_e, ev) => cb(ev)),
   // 终端会话(PTY 真实 claude):打开/写入/缩放/关闭
-  terminalOpen: (id) => ipcRenderer.invoke("terminal-open", id),
+  terminalOpen: (id, resumeId) => ipcRenderer.invoke("terminal-open", id, typeof resumeId === "string" ? resumeId : ""),
+  // 恢复对话候选:{ running, sessions:[{id,at,firstPrompt,busy,hot}] }(running=终端活着直接重附着)
+  terminalCandidates: (id) => ipcRenderer.invoke("terminal-candidates", id),
   terminalWrite: (id, data) => ipcRenderer.invoke("terminal-write", id, data),
   terminalResize: (id, cols, rows) => ipcRenderer.invoke("terminal-resize", id, cols, rows),
   terminalSizeOf: (id) => ipcRenderer.invoke("terminal-size-of", id),

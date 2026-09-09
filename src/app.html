@@ -76,7 +76,10 @@
       body {
         margin: 0;
         height: 100%;
-        overflow: hidden;
+        /* overflow:clip 而非 hidden:hidden 仍是滚动容器,Chromium 在 IME 组合输入时会
+           程序滚动它(scrollLeft 改变 → 整页/对话区左移几个像素,即之前误判的「窗口左移」);
+           clip 不创建滚动容器,程序滚动无效,从根上堵住这个移位 */
+        overflow: clip;
         background: var(--bg);
         color: var(--text);
       }

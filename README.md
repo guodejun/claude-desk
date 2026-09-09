@@ -6,19 +6,6 @@
 
 ![image-20260903150521891](assets/image-20260903150521891.png)
 
-> **一句话**：Claude Desk 是「会话管理壳」——每个会话背后都是一条真实的 `claude` 进程，对话手感、权限确认与终端里完全一致；它只负责把「多个会话的桌面管理」做得更顺，不改变模型行为。
-
-## 核心亮点
-
-- **多会话并行，互不打断**：顶部 tab 栏同时开多个会话，各自一条真实 claude，切换标签/页面**不中断进程**，终端常驻、无缝恢复重附着
-- **会话有记忆、可检索**：自动绑定目录与参数、按首条提问自动命名；列表按天分组、筛选（今天/昨天/任意日期）、分页；保留剥离 ANSI 的完整实录随时回看
-- **「问完答完才总结」的纪要**：按语义判定一轮问答结束（提问→有输出→输出停滞）才摘录，交给真实 claude 提炼 `【时间】👤提问 / 🤖回答要旨`，增量合并不重复调用
-- **上下文占用量化监控**：实时显示 `已用/上限 (百分比)`，彩色占比条分级预警（≥75% 红 / ≥50% 黄），支持「精确 / claude实测 / 估算」三档数据源
-- **斜杠命令 + 一键压缩**：`/context` `/compact` `/clear` `/rewind` `/resume` `/memory` `/model` 全部由 claude TUI 原生处理；`/compact` 自动轮询确认并替你还回 `y`
-- **批量喂题：对话队列**：多条问题排队，答完一条自动发下一条；支持暂停/停止/编辑/删除，条目持久化
-- **环境配置图形化**：命名配置模板（hooks/MCP/system prompt 一键写入）、白名单三件套 `settings.json` / `settings.local.json` / `CLAUDE.md` 直接编辑（语法高亮 + 原子写入）
-- **桌面应用该有的体贴**：暗/亮主题跟随 Windows 原生标题栏、关窗防误杀确认、缩小到托盘常驻、F11 全屏；全部数据本地落盘不联网上传
-
 ## 功能特性
 
 - **终端即对话**：每个会话一条真实交互式 claude 进程（PTY），点开即用、可结束/重开，**终端常驻、切换标签/页面不中断**，互不干扰
@@ -30,6 +17,8 @@
 - **配置文件白名单编辑**：仅允许读写 `~/.claude/settings.json`、`settings.local.json`、`CLAUDE.md`（JSON 先校验格式，原子写入，禁止任意路径）；编辑区带 JSON/Markdown 语法高亮
 - **命名配置模板**：把常用 settings 存成模板，一键应用；新建/编辑均支持内容回显与语法高亮
 - **本地持久化**：会话、设置、模板全部本地落盘
+- **手机远程控制（进阶）**：桌面端作为 device 经云中转 relay 外连，手机 H5 远程查看设备/会话并发消息，回答渲染回手机；详见下方「远程手机控制」
+- **稳定性保障**：单实例锁（防云端同 deviceId 双实例互踢）、禁 GPU（规避 GPU 崩溃退出）、渲染崩溃自愈、`exec` 超时看门狗（claude 僵死自动中断并释放队列）
 
 ## 技术栈
 
@@ -40,6 +29,7 @@
 | 前端 | SvelteKit + Svelte 5 + Vite（`adapter-static` 产出静态文件） |
 | 静态伺服 | `sirv` 内置 HTTP server 提供 `build/` 产物 |
 | 打包 | `electron-builder`（Linux: AppImage / tar.gz；Windows: portable / zip） |
+| 远程控制 | 云中转 relay `server/server.cjs`（WebSocket 路由，`ws`）+ 手机 H5 `server/public/` |
 
 ## 环境要求
 
@@ -111,6 +101,39 @@ CD_TERM_AUTOTEST=1 npm run app    # 终端主链路自测:建会话→进对话�
 # 主进程输出 AUTOTEST_PASS/FAIL,全部通过打印 AUTOTEST_OK ALL PASS
 ```
 
+## 远程手机控制(进阶)
+
+Claude Desk 不止是在你电脑上跑，还可以**用手机远程控制**桌面 claude：手机浏览器打开 H5，挑一台在线电脑，就能看它的会话列表、进对话、发消息，桌面 claude 的完整回答会渲染回手机。
+
+```
+┌──────────┐  主动外连   ┌──────────────┐   主动外连   ┌──────────┐
+│ 手机 H5  │ ─────────► │ 云中转 relay  │ ◄───────── │ 桌面(device)│
+│  (phone) │   /ws      │  server.cjs   │    /ws     │ electron  │
+└──────────┘            └──────────────┘            └──────────┘
+```
+
+- **云中转 relay**（`server/server.cjs`）：跑在一台公网/局域网服务器上。电脑端(device)与手机端(phone)都**主动外连**它，消息经它路由——绕过家用 NAT，两边无需端口映射。
+- **device(电脑端)**：开机即连上注册，能应答 `list-sessions` / `open-session` / `exec` / `stop`。
+- **phone(手机 H5)**：连上后看在线设备列表 → 选定一台 → 看它的会话列表 → 进对话发消息。
+- 协议：JSON over WebSocket（`/ws` 路径）；鉴权用**共享 token**（`server/config.json`，可用环境变量 `RELAY_TOKEN` / `--token` 覆盖）。
+
+> **稳定性保障**：桌面端有**单实例锁**（防云端同 deviceId 双实例互踢成 `online→off` 循环）、**禁 GPU**（规避 GPU 进程崩溃导致整体退出）、**渲染进程崩溃自愈**；`bridge` 对每个 `exec`/`choose` 设 **180s 超时看门狗**，claude 会话僵死时自动 Ctrl+C 中断并释放队列，避免「云端在线但消息石沉大海」。
+
+### 布置
+
+```bash
+# 1. 服务器上跑 relay(依赖仅 ws)
+cd server && npm install && npm start        # 监听 8123,/ws 路径,首次启动打印共享 token
+
+# 2. 桌面端连上 relay:配好 token 后启动,自动注册为 device
+
+# 3. 手机浏览器打开 relay 提供的 H5(如 nginx 反代 8088 /claude/),进入即见在线设备
+```
+
+> 生产上常用 nginx 反代并配 WebSocket upgrade 头：
+> `location /claude/ { proxy_pass http://127.0.0.1:8123/; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; }`
+> token 属敏感凭据，`server/config.json` 建议纳入 `.gitignore` 或用环境变量注入。
+
 ## 目录结构
 
 ```
@@ -121,9 +144,5 @@ static/            # 静态资源
 build/             # 前端构建产物(adapter-static，已 gitignore)
 dist/              # 打包产物(electron-builder，已 gitignore)
 assets/            # 打包图标
+server/            # 云中转 relay(远程手机控制): server.cjs 路由 + public/ 手机 H5 + config.json(共享 token)
 ```
-
-## 文档
-
-- [工具介绍](./docs/%E5%B7%A5%E5%85%B7%E4%BB%8B%E7%BB%8D.md) — 它是什么、为什么需要、核心能力、适用场景
-- [使用手册](./docs/%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C.md) — 快速上手、会话/终端/纪要/队列/设置的完整操作说明与 FAQ
