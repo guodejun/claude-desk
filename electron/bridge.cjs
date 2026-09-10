@@ -157,12 +157,19 @@ function waitReady(sessionId, readyTimeoutMs = 60000) {
       const raw = pty.rawOf(sessionId);
       if (raw !== lastRaw) { lastRaw = raw; quietSince = now; stable = 0; }
       const clean = pty.liveTranscript(sessionId, 200000) || "";
-      // 就绪特征:最后一个 ❯ 之后是「空白+分隔线─」(空输入框),而非用户文字/加载动画
+      // 就绪特征:最后一个 ❯ 之后是「空白+分隔线─」(空输入框),而非用户文字/加载动画。
+      // 注意 after 必须【只算 ❯ 到本行行尾】——claude 常在输入框 ❯ 的下一行打印警告/状态
+      // (如「Transcript saving is off」「? for shortcuts」/ 恢复对话的历史回显),
+      // 之前用 clean.slice(li+1) 不截行尾,会把下一行内容一并吞进 after,误判为「❯ 后还有文字
+      // = 未就绪」,导致 claude 明明已空闲却白等满 60s(实测 启动后首空 即此场景)。
       const li = clean.lastIndexOf("❯");
       let idlePrompt = false;
       if (li >= 0) {
-        const after = clean.slice(li + 1).replace(/^\s+/, ""); // ❯ 之后去前导空白
-        // 空输入框:紧跟 ─ 分隔线 / ⏵ 状态栏,或直接到串尾(无内容)
+        const nl = clean.indexOf("\n", li);
+        const after = clean.slice(li + 1, nl < 0 ? undefined : nl)
+          .replace(/^[\s\x1b]+/, "")   // 去前导空白与 BEL/退格/转义残片
+          .replace(//g, "").trim();
+        // 空输入框:紧跟 ─ 分隔线 / ⏵ 状态栏,或本行无内容
         idlePrompt = /^[─━]/.test(after) || after === "" || /^⏵/.test(after);
       }
       // 仍在输出字节 → 未就绪;静默超 1.2s 且出现空输入框 → 就绪
