@@ -329,12 +329,15 @@
     window.claude.terminalWrite(id, String(t).replace(/\r\n/g, "\n").replace(/\n/g, "\r"));
   }
   function copyTerm() {
-    // 有选区复制选区;TUI 重绘会让选区很快失效,没选到就用「复制整屏」兜底,保证一定有产出
+    // 有选区复制选区;TUI 重绘会让选区很快失效,没选到就用「复制整屏」兜底,保证一定有产出。
+    // 注意:claude TUI 持续整屏重绘/滚动会让「已选中」的选区退化成纯空白(如 "\n\n\n"),
+    // 此时 getSelection() 非空但 trim 后为空 —— 只判断非空会复制出一堆换行(粘贴后看似没复制)。
+    // 故以 trim 后是否仍有实义内容判定「真正选到了」,否则走整屏兜底。
     let sel = "";
     try {
       sel = term.getSelection() || "";
     } catch {}
-    if (sel) setClip(sel);
+    if (sel && sel.trim()) setClip(sel);
     else copyScreen();
   }
   // 复制最近一屏(claude 回答的可靠兜底:直接取自积累的行历史末端)

@@ -43,7 +43,8 @@ const BOOT_MS = 4500; // claude 启动打印横幅到就绪的大致耗时
 // claude 会话偶尔会「僵死」:①持续输出但永远不到空闲提示符(hasBody 有了但 idle 一直 false),
 // ②或静默不返回。此时 waitDone 靠 maxMs 兜底,而 maxMs 高达 8 分钟,期间串行队列
 // (enqueue)被该 exec 占满 → 手机端后续 open-session/exec/stop 全部排队,表现「cloud 在线但消息石沉大海」。
-// 这里给每个 exec 设一个较短的限时:超时即向终端发 Ctrl+C 中断,并置 aborted 让 waitDone 提前返回,
+// 这里给每个 exec 设一个较短的限时:超时即向终端发 Esc 中断(同手机端「停止」,claude 打断生成用 Esc),
+// 并置 aborted 让 waitDone 提前返回,
 // 保证队列释放、用户能感知「超时了」而不是无限等待。长回答(大表格/长代码)持续输出会一直重置
 // quietSince、且最终到 idle,不会被误伤;只有「异常不返回」才会撞上这个限时。
 const EXEC_WATCHDOG_MS = 180 * 1000; // 异常执行最多等 180s,超时强制中断
@@ -53,8 +54,8 @@ function armExecGuard(sessionId, msgId) {
   const g = { aborted: false, msgId };
   g.timer = setTimeout(() => {
     g.aborted = true;
-    log.log("warn", `[exec-guard] 会话 ${String(sessionId).slice(0, 8)}… 执行超 ${EXEC_WATCHDOG_MS / 1000}s 未完成,发送中断(Ctrl+C)`);
-    try { pty.write(sessionId, "\x03"); } catch {}
+    log.log("warn", `[exec-guard] 会话 ${String(sessionId).slice(0, 8)}… 执行超 ${EXEC_WATCHDOG_MS / 1000}s 未完成,发送中断(Esc)`);
+    try { pty.write(sessionId, "\x1b"); } catch {}
   }, EXEC_WATCHDOG_MS);
   execGuards.set(sessionId, g);
   return g;
@@ -841,8 +842,9 @@ function cleanAnswer(raw, input) {
   return lines.join("\n").replace(/\s+$/g, "").trim();
 }
 function handleStop(msgId, sessionId) {
-  // 中断正在进行的生成(Ctrl+C),终端若存在才写
-  const done = pty.write(sessionId, "\x03");
+  // 中断正在进行的生成 —— 用 Esc(claude TUI 打断当前回答的键,实测 Ctrl+C 是「按两次退出」,不打断),
+  // 终端若存在才写。Esc 在空闲态无副作用,不会误关会话。
+  const done = pty.write(sessionId, "\x1b");
   // 同时触发看门狗中止:让卡在 waitDone 的 exec 提前返回、释放串行队列(否则用户点了停止,
   // 队列仍被占着,后续消息进不来)。aborted 由 handleExec/handleChoose 的 finally 统一 disarm。
   const g = execGuards.get(sessionId);

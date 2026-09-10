@@ -277,6 +277,14 @@
   let chatTimer = null;
   let msgsKey = "";
   let lastMsgSeq = {};
+  let wmReady = {};         // 每会话「首屏 latest 是否已确认服务器水位」:打开空会话时它也是 true,
+  //                         否则轮询的 if(!wm) 门控会永远拦住 —— 电脑端后续在该会话产生消息就看不到了。
+  //                         空了也能以 afterSeq=0 做一次省钱的全量,取到内容后自动转回增量。
+  // 懒加载分页状态(按会话分):earlierHot 用「向上翻页」把更早的对话逐步前置。
+  let oldestSeq = {};       // 每会话已加载消息的最小 seq:「向上翻页」请求的 beforeSeq 取它
+  let hasMoreOld = {};      // 每会话是否还有更早的消息未加载(决定向上翻页是否继续)
+  let loadingOld = {};      // 每会话「向上翻页」请求进行中(防重复触发)
+  const PAGE_SIZE = 40;     // 懒加载每页条数:打开会话取最新一页,向上滚动逐页取更早
 
   // 会话历史落盘(localStorage):刷新/重开浏览器后仍能恢复"重新打开会话保留历史记录"。
   // 只存非 running 的消息、每个会话最多 60 条、每条截断 8000 字符,防 localStorage 超限。
@@ -597,6 +605,12 @@
     for (const b of list || []) if ((b.seq || 0) > m) m = b.seq;
     return m;
   }
+  // 消息列表里最小的带 seq 的消息(向上翻页的 beforeSeq 取它);无服务器消息时 0。
+  function minSeqOf(list) {
+    let mn = 0;
+    for (const b of list || []) if ((b.seq || 0) > 0 && (!mn || b.seq < mn)) mn = b.seq;
+    return mn;
+  }
 
   // 选过的选择器按钮要去掉:某 choice 之后已有新的 assistant 回答 = 用户已选过、claude 已继续,
   // 不再渲染旧按钮(否则自动刷新/重复打开会让按钮反复出现,可重复点)。从后往前,找到最近一条被
@@ -620,29 +634,48 @@
       if (pendingExec) return;                                        // 本端在回答:先不动
       if (!curSession || !curDevice) return;                          // 不在会话页
       if (!ws || ws.readyState !== 1) return;                         // 断线时不发
-      // 带 afterSeq 增量拉取:服务器只回 seq>水位的消息,长会话不再每次拉全量
-      send({ type: "messages", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: curSession.id, afterSeq: lastMsgSeq[curSession.id] || 0 });
+      const wm = lastMsgSeq[curSession.id] || 0;
+      if (!wmReady[curSession.id]) return;                            // 首屏 latest 尚未确认服务器水位:先不轮询,避免退成全量拉取
+      send({ type: "messages", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: curSession.id, afterSeq: wm, limit: PAGE_SIZE });
     }, 5000);
   }
   function stopAutoRefresh() { if (chatTimer) { clearInterval(chatTimer); chatTimer = null; } }
 
+  // 向上翻页加载更早的对话:滚动到消息区顶部时触发,把 beforeSeq 之前的一页前置到消息列表前面。
+  // hasMoreOld / loadingOld 防重复触发;返回后由 messages 分支做「前置 + 保持视口不跳」。
+  function loadOlder() {
+    const sid = curSession && curSession.id;
+    if (!sid) return;
+    if (!hasMoreOld[sid]) return;
+    if (loadingOld[sid]) return;
+    if (!oldestSeq[sid]) return;
+    loadingOld[sid] = true;
+    send({ type: "messages", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: sid, beforeSeq: oldestSeq[sid], limit: PAGE_SIZE });
+  }
+
   function openChat(s) {
     curSession = s;
     lastAnsIndex = -1; pendingExec = null;
-    // 复用本会话已缓存的历史会话(切走再切回、断线重连、刷新后重开都能恢复),不再清空
+    // 复用本会话已缓存的历史(切走再切回、断线重连、刷新后重开能立即看到内容);之后由 latest 以服务器为准
     msgs = msgsLoad()[s.id] || msgsCache.get(s.id) || [];
-    lastMsgSeq[s.id] = maxSeqOf(msgs);   // 恢复该会话已确认的服务器消息水位(增量轮询起点)
+    lastMsgSeq[s.id] = maxSeqOf(msgs);
+    oldestSeq[s.id] = minSeqOf(msgs);   // 缓存里已加载的最早 seq(向上翻页起点);无服务器消息则 0
+    hasMoreOld[s.id] = false;
+    loadingOld[s.id] = false;
+    // 缓存里已有消息:直接用该水位开放增量轮询(按 seq 增量天然安全,不依赖 latest 回来);
+    // 仅空缓存才等服务器 latest 确认水位(否则 afterSeq=0 会退成全量拉取)。
+    wmReady[s.id] = lastMsgSeq[s.id] > 0;
     $("chat-title").textContent = s.title || "未命名会话";
     $("chat-cwd").textContent = s.cwd || "";
     renderMsgs();
     msgsKey = msgsFingerprint(msgs);   // 记录打开瞬间已渲染内容,首轮 messages 若一致则不重绘
-    $("chat-ctx")._shown = false;
+    $("chat-ctx")._shown = true;       // 打开会话直接看对话内容,不再展示「最近记录」参考框
+    $("chat-ctx").style.display = "none";
     go("chat");
     hideBanner();
-    // 拉取近期上下文(设备把该会话末端实录回传,让手机看到之前对话)
-    send({ type: "open-session", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: s.id });
-    // 从服务器 DB 拉结构化历史:打开的瞬间直接渲染完整对话气泡(设备离线也能看到已入库的记录)
-    send({ type: "messages", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: s.id });
+    // 从服务器 DB 直接取权威历史(最新一页,懒加载):设备离线也能看已入库记录。
+    // 不再发 open-session —— 它的 tail 仅用于那个「最近记录」参考框,已按需求去掉。
+    send({ type: "messages", msgId: nextId(), deviceId: curDevice.deviceId, sessionId: s.id, latest: true, limit: PAGE_SIZE });
     startAutoRefresh();   // 会话打开期间定时自动刷新,桌端/其它端新消息自动跟进
     $("in-msg").focus();
   }
@@ -656,9 +689,13 @@
     }
   }
 
-  function renderMsgs() {
+  function renderMsgs(scrollBottom = true) {
     const el = $("msgs");
-    el.innerHTML = msgs.map((m, i) => {
+    if (!msgs.length) {
+      // 空会话:给个一次性的友好提示(与之前「最近记录」框的提示一致),不再单独弹参考框
+      el.innerHTML = '<div class="tt-top empty" style="text-align:center;margin:24px 0">（该会话还没有对话记录，发出的消息会同步到电脑端）</div>';
+    } else {
+      el.innerHTML = msgs.map((m, i) => {
       if (m.dir === "user") return `<div class="bubble user">${esc(m.text)}</div>`;
       if (m.running) return `<div class="bubble ans running" data-i="${i}"><span class="running-dot">◌</span> 回答中…</div>`;
       // 回答按 Markdown 渲染,手机上更精简清晰;失败时退回纯文本
@@ -681,9 +718,10 @@
         }
       }
       return html;
-    }).join("");
-    if (curSession) { msgsCache.set(curSession.id, msgs.map((m) => ({ ...m }))); msgsSave(); }
-    el.scrollTop = el.scrollHeight;
+      }).join("");
+      if (curSession) { msgsCache.set(curSession.id, msgs.map((m) => ({ ...m }))); msgsSave(); }
+      if (scrollBottom) el.scrollTop = el.scrollHeight;
+    }
   }
 
   function setBanner(t) { $("chat-banner").textContent = t; $("chat-banner").style.display = t ? "block" : "none"; }
@@ -800,58 +838,87 @@
         sessions = m.sessions || [];
         renderSessions();
       } else if (m.type === "session-info") {
-        if (curSession && m.sessionId === curSession.id) {
-          // 本地已缓存本会话历史(切回/重连),优先展示缓存的气泡;电脑端 recent 记录仅作参考框
-          const box = $("chat-ctx");
-          if (msgs.length && !box._shown) {
-            box.style.display = "none";
-            return;
-          }
-          box.style.display = "block";
-          box._shown = true;
-          // 最近记录同样按 Markdown 精简渲染;无记录时显示纯文本提示
-          box.innerHTML = m.tail
-            ? '<div class="tt-top">—— 电脑端该会话最近记录 ——</div><div class="md">' + mdHtml(cleanMobile(m.tail)) + '</div>'
-            : "（该会话还没有对话记录，发出的消息会同步到电脑端）";
-        }
+        // 已去掉「最近记录」参考框(打开会话直接看对话内容),在途/遗留的 session-info 一律忽略
+        $("chat-ctx").style.display = "none";
       } else if (m.type === "messages") {
         // 服务器 MySQL 历史:以它为本会话权威记录,保证与电脑端看到的内容一致。
-        // 打开会话即重建气泡(不再"有本地缓存就不读服务器"),否则手机端旧缓存会让两端不一致。
         // 仅当手机端此刻正跑着一条回答(pendingExec)时不覆盖,避免打断正在进行的对话。
-        // 带 afterSeq 的是每 5s 增量轮询(只回 seq>水位的新消息,合并追加);不带的是首屏/恢复的全量覆盖。
+        // 按请求模式区分:latest=首屏最新一页(整体替换)/ beforeSeq=向上翻更早(前置,保视口)/
+        // afterSeq>0=每 5s 增量轮询(只追加 seq>水位的消息)。
         if (curSession && m.sessionId === curSession.id && !pendingExec) {
-          const isIncr = (m.afterSeq || 0) > 0;
+          const sid = curSession.id;
           const hist = msgsFromDb(m.messages);
-          if (!hist.length) return;  // 服务器无历史:保留当前显示(含本端刚发送、尚未入库的消息)
-          const wm = lastMsgSeq[curSession.id] || 0;
-          if (isIncr) {
-            // 增量:只追加 seq>水位的消息;服务器按 afterSeq 已过滤,这里再兜底过滤一次
-            const add = hist.filter((b) => b.seq > wm);
-            if (!add.length) return;
-            // 本端刚发的消息(本地临时气泡无 seq)与服务器回显内容相同,合并时去掉本地那条,避免重复气泡
-            for (const nb of add) {
-              for (let li = msgs.length - 1; li >= Math.max(0, msgs.length - 6); li--) {
-                const lm = msgs[li];
-                if (!(lm.seq > 0) && lm.dir === nb.dir && (lm.text || "") === (nb.text || "")) { msgs.splice(li, 1); break; }
-              }
+          if (m.latest) {
+            // 首屏:服务器返回最新一页,整体替换为本会话权威记录(设备离线也能看到已入库内容)
+            if (!hist.length) {
+              // 服务器确实没有历史:保留当前显示。但仍标记「已确认」并锁水位为 0 ——
+              // 否则 wm=0 + if(!wm) 门控会永久拦住轮询,电脑端后来在这个空会话产生的消息就推不进来。
+              wmReady[sid] = true;
+              lastMsgSeq[sid] = 0;
+              hasMoreOld[sid] = false;
+              return;
             }
-            msgs = msgs.concat(add);
-            lastMsgSeq[curSession.id] = Math.max(wm, maxSeqOf(hist));
-            lastAnsIndex = -1;
-            stripOldChoosers(msgs);            // 新追加的后续回答会盖掉旧选择器按钮
-            msgsKey = msgsFingerprint(msgs);
-            renderMsgs();
-          } else {
-            // 全量覆盖(打开会话 / 断线重连后的首轮)
             stripOldChoosers(hist);
             const key = msgsFingerprint(hist);
-            if (lastDbTs(hist) <= lastDbTs(msgs)) return;  // 服务器历史未前进(该轮可能尚未入库):保留当前显示
-            if (key === msgsKey) return;  // 内容没变:不重绘,防滚动跳变/输入框失焦
+            wmReady[sid] = true;
+            // 先补懒加载水位(即使内容与缓存一致也要更新,否则长会话向上翻页的起点/是否还有更早会丢)
+            lastMsgSeq[sid] = maxSeqOf(hist);
+            oldestSeq[sid] = minSeqOf(hist);
+            hasMoreOld[sid] = m.hasMore === true;
+            if (key === msgsKey) return;            // 内容没变:只更新水位,不重绘,防滚动跳变
             msgs = hist;
             msgsKey = key;
-            lastMsgSeq[curSession.id] = maxSeqOf(hist);
             lastAnsIndex = -1;
             renderMsgs();
+          } else if (m.beforeSeq != null) {
+            // 向上翻页:把更早的一页前置到已有消息前面,并保持视口位置不跳
+            loadingOld[sid] = false;
+            if (!hist.length) { hasMoreOld[sid] = false; return; }
+            const el = $("msgs");
+            const prevH = el.scrollHeight;
+            const prevTop = el.scrollTop;
+            stripOldChoosers(hist);
+            msgs = hist.concat(msgs);               // 更早的在前面
+            oldestSeq[sid] = minSeqOf(msgs);
+            hasMoreOld[sid] = m.hasMore === true;
+            msgsKey = msgsFingerprint(msgs);
+            renderMsgs(false);                      // 不滚到底
+            el.scrollTop = prevTop + (el.scrollHeight - prevH);  // 视口稳定,不跳变
+          } else {
+            const isIncr = (m.afterSeq || 0) > 0;
+            if (!hist.length) return;  // 服务器无历史:保留当前显示(含本端刚发送、尚未入库的消息)
+            const wm = lastMsgSeq[sid] || 0;
+            if (isIncr) {
+              // 增量:只追加 seq>水位的消息;服务器按 afterSeq 已过滤,这里再兜底过滤一次
+              const add = hist.filter((b) => b.seq > wm);
+              if (!add.length) return;
+              // 本端刚发的消息(本地临时气泡无 seq)与服务器回显内容相同,合并时去掉本地那条,避免重复气泡
+              for (const nb of add) {
+                for (let li = msgs.length - 1; li >= Math.max(0, msgs.length - 6); li--) {
+                  const lm = msgs[li];
+                  if (!(lm.seq > 0) && lm.dir === nb.dir && (lm.text || "") === (nb.text || "")) { msgs.splice(li, 1); break; }
+                }
+              }
+              msgs = msgs.concat(add);
+              lastMsgSeq[sid] = Math.max(wm, maxSeqOf(hist));
+              lastAnsIndex = -1;
+              stripOldChoosers(msgs);            // 新追加的后续回答会盖掉旧选择器按钮
+              msgsKey = msgsFingerprint(msgs);
+              renderMsgs();
+            } else {
+              // 旧客户端 / 无 afterSeq 的全量覆盖(打开会话 / 断线重连后的首轮)
+              stripOldChoosers(hist);
+              const key = msgsFingerprint(hist);
+              if (lastDbTs(hist) <= lastDbTs(msgs)) return;  // 服务器历史未前进(该轮可能尚未入库):保留当前显示
+              if (key === msgsKey) return;  // 内容没变:不重绘,防滚动跳变/输入框失焦
+              msgs = hist;
+              msgsKey = key;
+              lastMsgSeq[sid] = maxSeqOf(hist);
+              oldestSeq[sid] = minSeqOf(hist);
+              hasMoreOld[sid] = m.hasMore === true;
+              lastAnsIndex = -1;
+              renderMsgs();
+            }
           }
         }
       } else if (m.type === "result") {
@@ -932,6 +999,14 @@
     else m.chooser.selected = m.chooser.selected.filter((k) => k !== key);
     const item = cb.closest(".chooser-item");
     if (item) item.classList.toggle("on", cb.checked);
+  });
+  // 向上翻页懒加载:滚动到消息区顶部时,拉取更早的一页对话(仅当还留有更早消息)
+  $("msgs").addEventListener("scroll", () => {
+    if (!curSession) return;
+    const el = $("msgs");
+    if (el.scrollTop > 24) return;              // 还没到顶部
+    if (el.scrollHeight <= el.clientHeight) return;  // 内容没撑出滚动条,没有更早可翻
+    loadOlder();
   });
   $("in-msg").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doSend(); } });
   tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });

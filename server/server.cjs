@@ -135,33 +135,59 @@ async function dbUpsertMessage(deviceId, sessionId, seq, msg) {
 }
 
 // 读一个会话的历史消息(按 seq 升序),blocks/options 反序列化回数组。
-// afterSeq 为增量水位:大于它才取,且每次最多 LIMIT 500 条,供手机端按 seq 增量轮询,
-// 避免长会话每次拉全量(可达 MB 级)。无 afterSeq 时全量返回(兼容旧客户端/首屏)。
-async function dbGetMessages(sessionId, afterSeq) {
-  if (!pool) return [];
+// opts 支持三种取法(手机端懒加载用),按优先级判断:
+//   { beforeSeq } : 向更早翻页,取 seq<beforeSeq 的最近 limit 条(返回升序),hasMore=是否还有更早
+//   { latest }    : 打开会话首屏,取最新 limit 条(返回升序),hasMore=是否还有更早未加载
+//   { afterSeq }  : 增量轮询,取 seq>afterSeq 的 limit 条(升序)
+//   无 opts       : 全量返回(兼容旧客户端/旧首屏)。
+// 返回 { messages:[...], hasMore:bool };afterSeq 增量与旧逻辑一致,只是改成按 limit 限量。
+async function dbGetMessages(sessionId, opts) {
+  if (!pool) return { messages: [], hasMore: false };
+  const limit = Math.max(1, Math.min(Number(opts && opts.limit) || 500, 500));
+  const mapRow = (r) => ({
+    seq: r.seq,
+    role: r.role,
+    text: r.text || "",
+    blocks: r.blocks ? JSON.parse(r.blocks) : undefined,
+    messageId: r.message_id || null,
+    ts: r.ts,
+    status: r.status || null,
+    type: r.type || null,
+    options: r.options ? JSON.parse(r.options) : undefined,
+  });
   try {
-    const isIncr = Number.isFinite(afterSeq) && afterSeq > 0;
-    const [rows] = await pool.query(
-      isIncr
-        ? "SELECT * FROM messages WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT 500"
-        : "SELECT * FROM messages WHERE session_id=? ORDER BY seq ASC",
-      isIncr ? [String(sessionId), Number(afterSeq)] : [String(sessionId)]
-    );
-    return rows.map((r) => ({
-      seq: r.seq,
-      role: r.role,
-      text: r.text || "",
-      blocks: r.blocks ? JSON.parse(r.blocks) : undefined,
-      messageId: r.message_id || null,
-      ts: r.ts,
-      status: r.status || null,
-      type: r.type || null,
-      options: r.options ? JSON.parse(r.options) : undefined,
-    }));
+    const sid = String(sessionId);
+    let rows;
+    let hasMore = false;
+    if (opts && opts.beforeSeq != null) {
+      const b = Number(opts.beforeSeq);
+      [rows] = await pool.query(
+        "SELECT * FROM messages WHERE session_id=? AND seq<? ORDER BY seq DESC LIMIT ?",
+        [sid, b, limit + 1]
+      );
+      hasMore = rows.length > limit;
+      rows = rows.slice(0, limit).sort((x, y) => x.seq - y.seq);
+    } else if (opts && opts.latest) {
+      [rows] = await pool.query(
+        "SELECT * FROM messages WHERE session_id=? ORDER BY seq DESC LIMIT ?",
+        [sid, limit + 1]
+      );
+      hasMore = rows.length > limit;
+      rows = rows.slice(0, limit).sort((x, y) => x.seq - y.seq);
+    } else {
+      const after = Number(opts && opts.afterSeq) || 0;
+      [rows] = await pool.query(
+        after > 0
+          ? "SELECT * FROM messages WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT ?"
+          : "SELECT * FROM messages WHERE session_id=? ORDER BY seq ASC",
+        after > 0 ? [sid, after, limit] : [sid]
+      );
+    }
+    return { messages: rows.map(mapRow), hasMore };
   } catch (e) {
-    // 历史读取失败会让手机端「打开会话/轮询」拿不到数据,必须留日志
+    // 历史读取失败会让手机端「打开会话/轮询/上翻」拿不到数据,必须留日志
     log("dbGetMessages 失败:", e && e.message);
-    return [];
+    return { messages: [], hasMore: false };
   }
 }
 
@@ -295,12 +321,17 @@ wss.on("connection", (ws, req) => {
         ws.send(JSON.stringify({ type: "devices", msgId: m.msgId, devices: list }));
       } else if (m.type === "messages") {
         // 手机端直接读服务器历史(不转发设备):设备离线也能看已入库的对话记录。
-        // 带 afterSeq 则只回 seq>afterSeq 的增量(每 5s 轮询),否则全量(首屏/旧客户端)。
-        dbGetMessages(m.sessionId, m.afterSeq).then((messages) => {
-          ws.send(JSON.stringify({ type: "messages", msgId: m.msgId, sessionId: m.sessionId, messages, afterSeq: m.afterSeq }));
+        // 按请求模式取:afterSeq 增量轮询 / latest 首屏最新一页 / beforeSeq 向上翻更早一页。
+        dbGetMessages(m.sessionId, m).then((r) => {
+          const out = { type: "messages", msgId: m.msgId, sessionId: m.sessionId, messages: r.messages, hasMore: r.hasMore };
+          // 回显请求模式,手机端据此区分首屏替换 / 向上翻页(前置) / 增量追加
+          if (m.afterSeq != null) out.afterSeq = m.afterSeq;
+          else if (m.beforeSeq != null) out.beforeSeq = m.beforeSeq;
+          else if (m.latest) out.latest = true;
+          ws.send(JSON.stringify(out));
         }).catch((e) => {
           log("dbGetMessages 承诺拒绝:", e && e.message);
-          ws.send(JSON.stringify({ type: "messages", msgId: m.msgId, sessionId: m.sessionId, messages: [], afterSeq: m.afterSeq }));
+          ws.send(JSON.stringify({ type: "messages", msgId: m.msgId, sessionId: m.sessionId, messages: [] }));
         });
       } else if (isRequest(m)) {
         forwardToDevice(ws, m);

@@ -4,7 +4,28 @@
 
 点击「会话」或「新建会话」即**在主界面直接打开一个真实 claude 交互终端**：自动进入该会话的工作目录、套用会话配置的参数，对话效果与终端 100% 一致（权限确认 / `/retry` `/rewind` / Ctrl+C / 状态栏 全部原样）。这个壳负责"会话管理 + 起终端 + 状态"，把 claude 的对话管理起来。
 
-![image-20260903150521891](assets/image-20260903150521891.png)
+## 界面预览
+
+### 桌面端（PC）
+
+会话对话主界面：左侧是**真实 claude 交互终端**，右侧「🧰 工具」面板（命令快捷 + 上下文监控）。
+
+![会话对话主界面：真实 claude 终端 + 工具面板 + 上下文监控](assets/pc-chat.png)
+
+### 手机远程控制（H5）
+
+手机浏览器打开 relay 提供的 H5，按「连接 → 选电脑 → 选会话 → 对话」四步即可远程操作桌面 claude：
+
+<table>
+  <tr>
+    <td align="center"><img src="assets/mobile-connect.png" width="130" alt="连接"><br>① 连接</td>
+    <td align="center"><img src="assets/mobile-devices.png" width="130" alt="选电脑"><br>② 选电脑</td>
+    <td align="center"><img src="assets/mobile-sessions.png" width="130" alt="选会话"><br>③ 选会话</td>
+    <td align="center"><img src="assets/mobile-chat.png" width="130" alt="对话"><br>④ 对话</td>
+  </tr>
+</table>
+
+> 桌面 claude 的完整回答（表格 / 代码块 / 选择器选项）会还原成干净 markdown 渲染回手机；历史入库 MySQL，设备离线也能看。
 
 ## 功能特性
 
@@ -133,6 +154,19 @@ cd server && npm install && npm start        # 监听 8123,/ws 路径,首次启�
 > 生产上常用 nginx 反代并配 WebSocket upgrade 头：
 > `location /claude/ { proxy_pass http://127.0.0.1:8123/; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; }`
 > token 属敏感凭据，`server/config.json` 建议纳入 `.gitignore` 或用环境变量注入。
+
+### 会话历史入库（MySQL）
+
+relay 不止转发消息，还用 **MySQL 存会话与对话历史**，让电脑端与手机端看**同一份**对话：
+
+- **表**：`sessions`（会话元信息）+ `messages`（消息；`(session_id, seq)` 唯一键**幂等 upsert**），启动自动建表
+- **电脑端上行**：建会话 / 改名 / 每次对话都上行入库（`db-session` / `db-message`）
+- **手机端读服务器**：打开会话直接读服务器历史为**权威**（`messages` 应答在非执行态时覆盖本地缓存），**设备离线也能看**已入库记录
+- **增量拉取**：手机端按 `afterSeq` 增量轮询（每次最多 500 条），长会话不重复拉全量
+- **连接优先级**：环境变量 `RELAY_DB_*` > `config.json` 的 `db` 字段 > 缺省 `127.0.0.1:3306`
+- db 连接失败时 relay **照常启动**（仅历史读写不可用），不拖垮消息转发
+
+> 需先在 MySQL 建库（表由 relay 自动创建）；`config.json` 的 `db` 字段含数据库密码，属敏感凭据，建议 `.gitignore` 或用 `RELAY_DB_*` 环境变量注入。
 
 ## 目录结构
 
